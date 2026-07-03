@@ -68,19 +68,187 @@ def chkbgp [ipaddr: string] {
     }
 }
 
+# Resolve an available Python interpreter (prefers python3)
+def py-bin [] {
+    for candidate in ["python3" "python"] {
+        let found = (try {
+            let command_paths = (which --all $candidate | where type == "external" | get path)
+            (($command_paths | where { |p| ($p | str trim) != "" and ($p | path exists) } | length) > 0)
+        } catch {
+            false
+        })
+        if $found { return $candidate }
+    }
+    error make { msg: "Python not found. Install python3 (or python) first." }
+}
+
+# Geolocate and enrich an IP or host (ip-api.com, no API key required)
+def ipinfo [target: string] {
+    if (($target | str trim) == "") {
+        error make { msg: "target cannot be empty." }
+    }
+    let fields = "status,message,query,continent,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as,asname,reverse,mobile,proxy,hosting"
+    let data = (http get $"http://ip-api.com/json/($target | str trim)?fields=($fields)")
+    if ($data.status? == "fail") {
+        error make { msg: $"ip-api error: ($data.message? | default 'unknown')" }
+    }
+    $data
+}
+
+# Read an API key from a dotfile, prompting once and saving it if missing
+def get-api-key [key_file: string, label: string] {
+    if ($key_file | path exists) {
+        let existing = (open $key_file | str trim)
+        if $existing != "" {
+            return $existing
+        }
+    }
+    let entered = (input $"(ansi cyan_bold)[(ansi red_bold)+(ansi cyan_bold)](ansi reset) Enter your ($label) API key: " | str trim)
+    if $entered == "" {
+        error make { msg: $"($label) API key cannot be empty." }
+    }
+    $entered | save -f $key_file
+    print $"\n(ansi cyan_bold)[(ansi red_bold)+(ansi cyan_bold)](ansi reset) Key saved to ($key_file)."
+    $entered
+}
+
+# Best-effort classification of an IOC string
+def ioc-type [value: string] {
+    let v = ($value | str trim)
+    if (($v | parse --regex '^(?:\d{1,3}\.){3}\d{1,3}$' | length) > 0) {
+        "ip"
+    } else if (
+        (($v | parse --regex '^[a-fA-F0-9]{32}$' | length) > 0)
+        or (($v | parse --regex '^[a-fA-F0-9]{40}$' | length) > 0)
+        or (($v | parse --regex '^[a-fA-F0-9]{64}$' | length) > 0)
+    ) {
+        "hash"
+    } else if ($v | str downcase | str starts-with "http") {
+        "url"
+    } else {
+        "domain"
+    }
+}
+
+# VirusTotal v3 lookup for an IP, domain, file hash, or URL
+def vt [ioc: string, --type: string] {
+    let key = (get-api-key $"($env.HOME)/.vtkey.txt" "VirusTotal")
+    let value = ($ioc | str trim)
+    if $value == "" { error make { msg: "ioc cannot be empty." } }
+    let kind = if $type != null { ($type | str downcase) } else { (ioc-type $value) }
+
+    let endpoint = if $kind == "ip" {
+        $"ip_addresses/($value)"
+    } else if $kind == "domain" {
+        $"domains/($value)"
+    } else if ($kind in ["hash" "file"]) {
+        $"files/($value)"
+    } else if $kind == "url" {
+        let id = ($value | encode base64 | str replace --all "+" "-" | str replace --all "/" "_" | str replace --all "=" "")
+        $"urls/($id)"
+    } else {
+        error make { msg: $"Unsupported --type: ($kind). Use ip|domain|hash|url." }
+    }
+
+    let resp = (try {
+        http get --headers ["x-apikey" $key] $"https://www.virustotal.com/api/v3/($endpoint)"
+    } catch { |err|
+        error make { msg: $"VirusTotal request failed (bad key/quota or IOC not found): ($err.msg)" }
+    })
+
+    let attr = $resp.data.attributes
+    let stats = ($attr.last_analysis_stats? | default {})
+    {
+        ioc: $value
+        type: $kind
+        malicious: ($stats.malicious? | default 0)
+        suspicious: ($stats.suspicious? | default 0)
+        harmless: ($stats.harmless? | default 0)
+        undetected: ($stats.undetected? | default 0)
+        reputation: ($attr.reputation? | default "-")
+        label: ($attr.meaningful_name? | default ($attr.as_owner? | default ($attr.registrar? | default "-")))
+        country: ($attr.country? | default "-")
+        tags: ($attr.tags? | default [])
+    }
+}
+
+# AbuseIPDB reputation check for an IP
+def abuse [ip: string, --days: int = 90] {
+    let key = (get-api-key $"($env.HOME)/.abuseipdbkey.txt" "AbuseIPDB")
+    let target = ($ip | str trim)
+    if $target == "" { error make { msg: "ip cannot be empty." } }
+
+    let resp = (try {
+        http get --headers ["Key" $key "Accept" "application/json"] $"https://api.abuseipdb.com/api/v2/check?ipAddress=($target)&maxAgeInDays=($days)"
+    } catch { |err|
+        error make { msg: $"AbuseIPDB request failed (bad key/quota): ($err.msg)" }
+    })
+
+    let d = $resp.data
+    {
+        ip: ($d.ipAddress? | default $target)
+        abuseScore: ($d.abuseConfidenceScore? | default 0)
+        totalReports: ($d.totalReports? | default 0)
+        country: ($d.countryCode? | default "-")
+        isp: ($d.isp? | default "-")
+        domain: ($d.domain? | default "-")
+        usageType: ($d.usageType? | default "-")
+        isTor: ($d.isTor? | default false)
+        lastReported: ($d.lastReportedAt? | default "-")
+    }
+}
+
+# AlienVault OTX general indicator lookup (IP, domain, hash, URL)
+def otx [ioc: string, --type: string] {
+    let key = (get-api-key $"($env.HOME)/.otxkey.txt" "AlienVault OTX")
+    let value = ($ioc | str trim)
+    if $value == "" { error make { msg: "ioc cannot be empty." } }
+    let kind = if $type != null { ($type | str downcase) } else { (ioc-type $value) }
+
+    let section = if $kind == "ip" {
+        "IPv4"
+    } else if $kind == "domain" {
+        "domain"
+    } else if ($kind in ["hash" "file"]) {
+        "file"
+    } else if $kind == "url" {
+        "url"
+    } else {
+        error make { msg: $"Unsupported --type: ($kind). Use ip|domain|hash|url." }
+    }
+
+    let resp = (try {
+        http get --headers ["X-OTX-API-KEY" $key] $"https://otx.alienvault.com/api/v1/indicators/($section)/($value)/general"
+    } catch { |err|
+        error make { msg: $"OTX request failed (bad key or IOC not found): ($err.msg)" }
+    })
+
+    let pulses = ($resp.pulse_info.pulses? | default [])
+    {
+        ioc: $value
+        type: $section
+        pulse_count: ($resp.pulse_info.count? | default 0)
+        pulses: ($pulses | each { |p| $p.name? | default "-" } | first 5)
+        malware_families: ($resp.pulse_info.related?.alienvault?.malware_families? | default [])
+        country: ($resp.country_name? | default "-")
+        asn: ($resp.asn? | default "-")
+    }
+}
+
 # Start HTTPSERVER
 def hs [--path: string] {
+    let py = (py-bin)
     if $path != null {
         let abs_path = ($path | str trim)
-        python -m http.server -d $abs_path
+        run-external $py "-m" "http.server" "-d" $abs_path
     } else {
-        python -m http.server
+        run-external $py "-m" "http.server"
     }
 }
 
 # Output with syntax highlighting
 def catt [targetfile: string] {
-    python -m rich.syntax $targetfile
+    run-external (py-bin) "-m" "rich.syntax" $targetfile
 }
 
 # Get Ifaces
@@ -329,6 +497,10 @@ def pdsc [tool_name: string] {
 def hlp [command?: string, --verbose (-v)] {
     let summaries = {
         chkbgp: "Fetch ASN/BGP details for an IP."
+        ipinfo: "Geolocate/enrich an IP or host (ip-api)."
+        vt: "VirusTotal lookup (IP/domain/hash/URL)."
+        abuse: "AbuseIPDB reputation check for an IP."
+        otx: "AlienVault OTX indicator lookup."
         hs: "Start a quick HTTP file server."
         catt: "Show a file with syntax highlighting."
         ifc: "List network interfaces."
@@ -347,7 +519,10 @@ def hlp [command?: string, --verbose (-v)] {
         pdsc: "Install a ProjectDiscovery tool with Go."
         hlp: "Show commands and usage examples."
         shx: "Run subfinder + httpx domain scan."
-        bdc: "Decode Base64 text."
+        bdc: "Decode/encode Base64 text."
+        defang: "Defang IOCs for safe sharing."
+        refang: "Refang defanged IOCs."
+        hashf: "Compute md5/sha1/sha256 of a file."
         hdns: "Hunt candidate C2 domains with hednsextractor."
         "windows-evt-hunt": "Hunt Windows Event Log entries quickly."
         "persist-hunt": "Hunt persistence artifacts on host."
@@ -374,6 +549,10 @@ def hlp [command?: string, --verbose (-v)] {
 
     let samples = {
         chkbgp: "chkbgp 8.8.8.8"
+        ipinfo: "ipinfo 8.8.8.8"
+        vt: "vt 8.8.8.8"
+        abuse: "abuse 45.83.12.9"
+        otx: "otx baddomain.com"
         hs: "hs --path /tmp/share"
         catt: "catt configs/config.nu"
         ifc: "ifc"
@@ -393,6 +572,9 @@ def hlp [command?: string, --verbose (-v)] {
         hlp: "hlp -v"
         shx: "shx example.com"
         bdc: "bdc SGVsbG8="
+        defang: "defang https://evil.example.com/path"
+        refang: "refang hxxps://evil[.]example[.]com/path"
+        hashf: "hashf suspicious.bin"
         hdns: "hdns suspicious-domain.com"
         "windows-evt-hunt": "windows-evt-hunt --log Security --event-id 4625 --since-hours 24"
         "persist-hunt": "persist-hunt --contains cron --limit 50"
@@ -426,6 +608,21 @@ def hlp [command?: string, --verbose (-v)] {
         tfox: [
             "tfox --dtype url"
             "tfox --dtype all"
+        ]
+        vt: [
+            "vt 8.8.8.8"
+            "vt 44d88612fea8a8f36de82e1278abb02f --type hash"
+            "vt evil.example.com"
+            "vt https://evil.example.com/payload --type url"
+        ]
+        abuse: [
+            "abuse 45.83.12.9"
+            "abuse 45.83.12.9 --days 30"
+        ]
+        otx: [
+            "otx baddomain.com"
+            "otx 45.83.12.9"
+            "otx 44d88612fea8a8f36de82e1278abb02f --type hash"
         ]
         triage: [
             "triage --family agenttesla --limit 5"
@@ -540,9 +737,65 @@ def shx [target_domain: string] {
     subfinder -silent -d $target_domain | httpx -silent -mc 200 -sc -title -td
 }
 
-# Base64 decoder
-def bdc [pattern: string] {
-    echo $pattern | base64 -d
+# Base64 decode/encode (native, cross-platform)
+def bdc [pattern: string, --encode (-e)] {
+    if $encode {
+        $pattern | encode base64
+    } else {
+        $pattern | decode base64 | decode
+    }
+}
+
+# Defang IOCs so URLs/IPs/domains are safe to paste in reports/chats
+def defang [ioc: string] {
+    $ioc
+    | str replace --all "https://" "hxxps://"
+    | str replace --all "http://" "hxxp://"
+    | str replace --all "." "[.]"
+    | str replace --all "@" "[@]"
+}
+
+# Refang defanged IOCs back into their original form
+def refang [ioc: string] {
+    $ioc
+    | str replace --all "[.]" "."
+    | str replace --all "(.)" "."
+    | str replace --all "[@]" "@"
+    | str replace --all "[:]" ":"
+    | str replace --all "hxxps://" "https://"
+    | str replace --all "hxxp://" "http://"
+    | str replace --all "hxxps" "https"
+    | str replace --all "hxxp" "http"
+}
+
+# Compute file hashes (md5/sha256 native, sha1 via sha1sum when present)
+def hashf [target_file: string] {
+    if (($target_file | path exists) == false) {
+        error make { msg: $"File not found: ($target_file)" }
+    }
+    if ((try { $target_file | path type } catch { "other" }) != "file") {
+        error make { msg: $"Not a file: ($target_file)" }
+    }
+
+    let bytes = (open --raw $target_file)
+    let sha1 = (try {
+        let out = (^sha1sum $target_file | complete)
+        if $out.exit_code == 0 {
+            $out.stdout | str trim | split row " " | first
+        } else {
+            "-"
+        }
+    } catch {
+        "-"
+    })
+
+    {
+        file: $target_file
+        size: (ls $target_file | get 0.size)
+        md5: ($bytes | hash md5)
+        sha1: $sha1
+        sha256: ($bytes | hash sha256)
+    }
 }
 
 # Normalize parsed JSON output to a list of records
@@ -1231,9 +1484,32 @@ def clean [] {
     }
 }
 
-# Get ARP table with style!
+# Get ARP/neighbor table with style!
 def arpt [] {
-    arp -a | lines | split column " " | select column2 column4 column5 column7 | rename IP_Address MAC_Address Proto Interface
+    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let has_external_cmd = { |command: string|
+        (try {
+            let command_paths = (which --all $command | where type == "external" | get path)
+            (($command_paths | where { |candidate| ($candidate | str trim) != "" and ($candidate | path exists) } | length) > 0)
+        } catch {
+            false
+        })
+    }
+
+    if $is_windows {
+        arp -a
+        | lines
+        | parse --regex '\s*(?<IP_Address>(?:[0-9]{1,3}\.){3}[0-9]{1,3})\s+(?<MAC_Address>[0-9a-fA-F-]{11,17})\s+(?<Type>\w+)'
+    } else if (do $has_external_cmd "ip") {
+        ip neigh
+        | lines
+        | parse --regex '^(?<IP_Address>\S+)\s+dev\s+(?<Interface>\S+)(?:\s+lladdr\s+(?<MAC_Address>\S+))?.*\s(?<State>\S+)\s*$'
+        | where { |row| ($row.MAC_Address? | default "") != "" }
+    } else if (do $has_external_cmd "arp") {
+        arp -a | lines | split column " " | select column2 column4 column5 column7 | rename IP_Address MAC_Address Proto Interface
+    } else {
+        error make { msg: "No ARP source found (need 'ip' or 'arp')." }
+    }
 }
 
 # Search for target file in the system
@@ -1317,7 +1593,7 @@ def dls [] {
         sys disks
     } else {
         if (do $has_external_cmd "lsblk") {
-            lsblk -r | lines | split column " " | skip 1 |select column1 column2 column3 column4 column5 column6 column7 | rename NAME MAJ:MIN RM SIZE RO TYPE MOUNTPOINTS
+            lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT | detect columns
         } else {
             sys disks
         }
