@@ -113,6 +113,86 @@ def ioc-type [value: string] {
     }
 }
 
+# Extract the bare host/IP from an IOC value (url, ip:port, domain, ip)
+def ioc-host [value: string] {
+    mut h = ($value | str trim | str lowercase)
+    $h = ($h | str replace --regex '^[a-z0-9+.-]+://' '')   # strip scheme
+    $h = ($h | split row '/' | first)                        # strip path
+    $h = ($h | split row '?' | first)                        # strip query
+    $h = ($h | split row '@' | last)                         # strip userinfo
+    $h = ($h | str replace --regex ':[0-9]+$' '')            # strip :port
+    $h = ($h | str trim --char '[' | str trim --char ']')    # strip ipv6 brackets
+    $h
+}
+
+# Batch-geolocate IPs via ip-api.com (no key). Returns a table {ip, cc, country, isp}.
+def geo-batch [ips: list<string>] {
+    mut rows = []
+    for chunk in ($ips | uniq | chunks 100) {
+        let resp = (try {
+            http post --content-type application/json "http://ip-api.com/batch?fields=status,query,countryCode,country,isp" $chunk
+        } catch {
+            []
+        })
+        for r in $resp {
+            if (($r.status? | default "") == "success") {
+                $rows ++= [{
+                    ip: ($r.query? | default "")
+                    cc: ($r.countryCode? | default "")
+                    country: ($r.country? | default "")
+                    isp: ($r.isp? | default "")
+                }]
+            }
+        }
+        sleep 300ms   # stay under ip-api's batch rate limit
+    }
+    $rows
+}
+
+# Keep only rows attributed to a target country code.
+#   - IP hosts are geolocated via ip-api (no key)
+#   - domain hosts match by ccTLD (endswith .<cc>), plus common .com.<cc> style
+# Each kept row gains `cc` (and `geo_isp` for IP rows). host_field extracts the IOC string.
+def geo-filter [
+    rows: list<any>          # input records
+    cc: string               # ISO country code, e.g. TR
+    host_field: closure      # extracts the host/ip/url string from a row
+    --geo-cap: int = 500     # max unique IPs to geolocate
+] {
+    let target = ($cc | str trim | str uppercase)
+    if $target == "" { return $rows }
+    let cc_lower = ($target | str lowercase)
+
+    let is_ipv4 = { |v: string| (($v | parse --regex '^(?:\d{1,3}\.){3}\d{1,3}$' | length) > 0) }
+
+    let tagged = ($rows | each { |r|
+        let host = (ioc-host (do $host_field $r | into string))
+        { row: $r, host: $host, is_ip: (do $is_ipv4 $host) }
+    })
+
+    let ip_hosts = ($tagged | where is_ip | get host | uniq | first $geo_cap)
+    let geo = (if (($ip_hosts | length) > 0) { geo-batch $ip_hosts } else { [] })
+
+    let is_record = { |r| (($r | describe) | str starts-with "record") }
+
+    $tagged | each { |t|
+        if $t.is_ip {
+            let match = ($geo | where ip == $t.host)
+            if (($match | length) > 0) and (($match | get cc.0) == $target) {
+                if (do $is_record $t.row) { $t.row | merge { cc: $target, geo_isp: ($match | get isp.0) } } else { $t.row }
+            } else {
+                null
+            }
+        } else {
+            if (($t.host | str ends-with $".($cc_lower)")) {
+                if (do $is_record $t.row) { $t.row | merge { cc: $target } } else { $t.row }
+            } else {
+                null
+            }
+        }
+    } | where { |x| $x != null }
+}
+
 # Reputation lookup for any IOC using key-free sources.
 #   hash   -> CIRCL hashlookup (KnownMalicious flag + file metadata)
 #   ip     -> ISC SANS DShield (attack/report counts)
@@ -274,6 +354,7 @@ def otx [
     ioc: string        # IP/domain/URL/hash substring OR malware family name
     --recent           # Search only the recent rolling feed (faster, less coverage)
     --refresh          # Force refresh of the cached full export
+    --cc: string       # Keep only IOCs in this country (e.g. TR); geolocates IPs + ccTLD domains
     --limit: int = 50  # Max rows returned
 ] {
     let raw_needle = ($ioc | str trim | str lowercase)
@@ -317,11 +398,18 @@ def otx [
         }
         | uniq)
 
-    let source = if $recent { "recent feed" } else { "full export" }
-    if (($matches | length) == 0) {
-        print $"(ansi yellow_bold)[otx](ansi reset) No match in ThreatFox ($source) for: ($ioc)."
+    let filtered = if ($cc != null and (($cc | str trim) != "")) {
+        geo-filter $matches ($cc) { |row| $row.ioc }
+    } else {
+        $matches
     }
-    if $limit > 0 { $matches | first $limit } else { $matches }
+
+    let source = if $recent { "recent feed" } else { "full export" }
+    if (($filtered | length) == 0) {
+        let cc_note = if ($cc != null and (($cc | str trim) != "")) { $" in ($cc | str uppercase)" } else { "" }
+        print $"(ansi yellow_bold)[otx](ansi reset) No match in ThreatFox ($source)($cc_note) for: ($ioc)."
+    }
+    if $limit > 0 { $filtered | first $limit } else { $filtered }
 }
 
 # Start HTTPSERVER
@@ -439,9 +527,14 @@ def netcon [] {
     }
 }
 
-# Fetch last 50 C2 panel from Viriback
-def vrb [] {
-    http get https://tracker.viriback.com/last50.php | to json | from json
+# Fetch last 50 C2 panels from Viriback (optionally filter by country)
+def vrb [--cc: string] {
+    let rows = (http get https://tracker.viriback.com/last50.php)
+    if ($cc != null and (($cc | str trim) != "")) {
+        geo-filter $rows ($cc) { |row| $row.IP? | default ($row.URL? | default "") }
+    } else {
+        $rows
+    }
 }
 
 # Fetch data from URLHAUS
@@ -453,6 +546,7 @@ def haus [
     --host-contains: string      # Case-insensitive host contains filter
     --host-ends-with: string     # Host suffix filter, e.g. .tr
     --https-only                 # Keep only https URLs
+    --cc: string                 # Keep only entries in this country (geolocates hosts), e.g. TR
     --raw                        # Return raw feed without cleanup/filtering
 ] {
     let url_host = { |url_value: string|
@@ -517,6 +611,10 @@ def haus [
             })
         }
 
+        if ($cc != null and (($cc | str trim) != "")) {
+            $urls = (geo-filter $urls ($cc) { |u| $u })
+        }
+
         if $host_only {
             let hosts = ($urls | each { |u| do $url_host $u } | where { |h| $h != null and ($h | str trim) != "" } | uniq)
             if $limit > 0 { $hosts | first $limit } else { $hosts }
@@ -526,27 +624,36 @@ def haus [
     }
 }
 
-# Fetch data from ThreatFox
-def tfox [--dtype: string] {
+# Fetch data from ThreatFox (optionally filter by country)
+def tfox [--dtype: string, --cc: string] {
     let buffer = http get https://threatfox.abuse.ch/export/json/urls/recent/ | values
+    let has_cc = ($cc != null and (($cc | str trim) != ""))
     mut data_array = []
     if $dtype == "all" {
         for data in ($buffer) {
             $data_array ++= [{
-                "ioc": $data.ioc_value.0, 
-                "threat_type": $data.threat_type.0, 
-                "malware": $data.malware.0, 
-                "malware_printable": $data.malware_printable.0, 
-                "tags": $data.tags, 
+                "ioc": $data.ioc_value.0,
+                "threat_type": $data.threat_type.0,
+                "malware": $data.malware.0,
+                "malware_printable": $data.malware_printable.0,
+                "tags": $data.tags,
                 "reference": $data.reference
             }]
         }
-        $data_array | table
+        if $has_cc {
+            geo-filter $data_array ($cc) { |row| $row.ioc }
+        } else {
+            $data_array
+        }
     } else if $dtype == "url" {
         for data in ($buffer) {
             $data_array ++= [($data | get 0 | get ioc_value | to text)]
         }
-        $data_array
+        if $has_cc {
+            geo-filter $data_array ($cc) { |u| $u }
+        } else {
+            $data_array
+        }
     } else {
         "You must use: --dtype all/url"
     }
@@ -653,7 +760,7 @@ def hlp [command?: string, --verbose (-v)] {
         aget: "aget nmap"
         arem: "arem nmap"
         netcon: "netcon"
-        vrb: "vrb"
+        vrb: "vrb --cc TR"
         haus: "haus normal --limit 20"
         tfox: "tfox --dtype url"
         hx: "hx subdomains.txt"
@@ -693,10 +800,20 @@ def hlp [command?: string, --verbose (-v)] {
             "haus normal --limit 20"
             "haus --host-only --contains \"in.net\" --limit 10"
             "haus --host-ends-with \".tr\" --host-only --limit 20"
+            "haus online --cc TR --host-only   # only IOCs geolocated to Turkey"
         ]
         tfox: [
             "tfox --dtype url"
             "tfox --dtype all"
+            "tfox --dtype all --cc TR   # only Turkey-based IOCs"
+        ]
+        vrb: [
+            "vrb"
+            "vrb --cc TR   # only Turkey-based C2 panels"
+        ]
+        pls: [
+            "pls"
+            "pls --cc TR   # only Turkish proxies"
         ]
         vt: [
             "vt 44d88612fea8a8f36de82e1278abb02f   # hash -> CIRCL hashlookup"
@@ -710,7 +827,7 @@ def hlp [command?: string, --verbose (-v)] {
         otx: [
             "otx agenttesla        # by malware family name (full export)"
             "otx 45.83.12.9        # by IP/domain/url substring"
-            "otx bad.example.com"
+            "otx cobaltstrike --cc TR   # only Turkey-based C2s"
             "otx remcos --recent   # fast, recent feed only"
             "otx formbook --refresh # force-refresh cached full export"
         ]
@@ -1868,8 +1985,8 @@ def rware [
     }
 }
 
-# Fetch latest proxy list
-def pls [] {
+# Fetch latest proxy list (optionally filter by country)
+def pls [--cc: string] {
     let pdata = (http get https://raw.githubusercontent.com/themiralay/Proxy-List-World/refs/heads/master/data-with-geolocation.json | to json | from json)
     mut p_array = []
     for d in ($pdata) {
@@ -1883,7 +2000,12 @@ def pls [] {
             "as": $d.geolocation.as
         }]
     }
-    $p_array
+    if ($cc != null and (($cc | str trim) != "")) {
+        let target = ($cc | str trim | str uppercase)
+        $p_array | where { |row| ($row.country_code | into string | str uppercase) == $target }
+    } else {
+        $p_array
+    }
 }
 
 # Enumerate subdomains using crt.sh (faster than shx command but no httpx!)
