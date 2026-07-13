@@ -95,23 +95,6 @@ def ipinfo [target: string] {
     $data
 }
 
-# Read an API key from a dotfile, prompting once and saving it if missing
-def get-api-key [key_file: string, label: string] {
-    if ($key_file | path exists) {
-        let existing = (open $key_file | str trim)
-        if $existing != "" {
-            return $existing
-        }
-    }
-    let entered = (input $"(ansi cyan_bold)[(ansi red_bold)+(ansi cyan_bold)](ansi reset) Enter your ($label) API key: " | str trim)
-    if $entered == "" {
-        error make { msg: $"($label) API key cannot be empty." }
-    }
-    $entered | save -f $key_file
-    print $"\n(ansi cyan_bold)[(ansi red_bold)+(ansi cyan_bold)](ansi reset) Key saved to ($key_file)."
-    $entered
-}
-
 # Best-effort classification of an IOC string
 def ioc-type [value: string] {
     let v = ($value | str trim)
@@ -130,109 +113,150 @@ def ioc-type [value: string] {
     }
 }
 
-# VirusTotal v3 lookup for an IP, domain, file hash, or URL
+# Reputation lookup for any IOC using key-free sources.
+#   hash   -> CIRCL hashlookup (KnownMalicious flag + file metadata)
+#   ip     -> ISC SANS DShield (attack/report counts)
+#   domain -> urlscan.io recent scans + malicious verdict count
+#   url    -> urlscan.io recent scans for the URL
 def vt [ioc: string, --type: string] {
-    let key = (get-api-key $"($env.HOME)/.vtkey.txt" "VirusTotal")
     let value = ($ioc | str trim)
     if $value == "" { error make { msg: "ioc cannot be empty." } }
     let kind = if $type != null { ($type | str downcase) } else { (ioc-type $value) }
 
-    let endpoint = if $kind == "ip" {
-        $"ip_addresses/($value)"
-    } else if $kind == "domain" {
-        $"domains/($value)"
-    } else if ($kind in ["hash" "file"]) {
-        $"files/($value)"
-    } else if $kind == "url" {
-        let id = ($value | encode base64 | str replace --all "+" "-" | str replace --all "/" "_" | str replace --all "=" "")
-        $"urls/($id)"
+    if ($kind in ["hash" "file"]) {
+        let algo = if (($value | str length) == 32) {
+            "md5"
+        } else if (($value | str length) == 40) {
+            "sha1"
+        } else if (($value | str length) == 64) {
+            "sha256"
+        } else {
+            error make { msg: "hash must be md5(32), sha1(40) or sha256(64) hex chars." }
+        }
+        let resp = (try {
+            http get $"https://hashlookup.circl.lu/lookup/($algo)/($value)"
+        } catch {
+            null
+        })
+        if ($resp == null or ($resp.message? | default "") =~ "(?i)not found") {
+            {
+                ioc: $value
+                type: "hash"
+                source: "circl-hashlookup"
+                known: false
+                verdict: "unknown (not in dataset)"
+                filename: "-"
+                filesize: "-"
+            }
+        } else {
+            let malicious_src = ($resp.KnownMalicious? | default "")
+            {
+                ioc: $value
+                type: "hash"
+                source: "circl-hashlookup"
+                known: true
+                verdict: (if $malicious_src != "" { $"malicious \(($malicious_src)\)" } else { "known / likely benign (NSRL)" })
+                filename: ($resp.FileName? | default "-")
+                filesize: ($resp.FileSize? | default "-")
+            }
+        }
+    } else if $kind == "ip" {
+        abuse $value
+    } else if ($kind in ["domain" "url"]) {
+        let query = if $kind == "domain" { $"domain:($value)" } else { $"page.url:\"($value)\"" }
+        let resp = (try {
+            http get $"https://urlscan.io/api/v1/search/?q=($query)&size=100"
+        } catch { |err|
+            error make { msg: $"urlscan.io request failed: ($err.msg)" }
+        })
+        let results = ($resp.results? | default [])
+        let malicious = ($results | where { |r| ($r.verdicts?.overall?.malicious? | default false) } | length)
+        let tags = ($results | each { |r| $r.task?.tags? | default [] } | flatten | uniq | first 10)
+        {
+            ioc: $value
+            type: $kind
+            source: "urlscan.io"
+            total_scans: ($results | length)
+            malicious_scans: $malicious
+            tags: $tags
+            last_scan: (try { $results | get 0.task.time } catch { "-" })
+        }
     } else {
         error make { msg: $"Unsupported --type: ($kind). Use ip|domain|hash|url." }
     }
-
-    let resp = (try {
-        http get --headers ["x-apikey" $key] $"https://www.virustotal.com/api/v3/($endpoint)"
-    } catch { |err|
-        error make { msg: $"VirusTotal request failed (bad key/quota or IOC not found): ($err.msg)" }
-    })
-
-    let attr = $resp.data.attributes
-    let stats = ($attr.last_analysis_stats? | default {})
-    {
-        ioc: $value
-        type: $kind
-        malicious: ($stats.malicious? | default 0)
-        suspicious: ($stats.suspicious? | default 0)
-        harmless: ($stats.harmless? | default 0)
-        undetected: ($stats.undetected? | default 0)
-        reputation: ($attr.reputation? | default "-")
-        label: ($attr.meaningful_name? | default ($attr.as_owner? | default ($attr.registrar? | default "-")))
-        country: ($attr.country? | default "-")
-        tags: ($attr.tags? | default [])
-    }
 }
 
-# AbuseIPDB reputation check for an IP
-def abuse [ip: string, --days: int = 90] {
-    let key = (get-api-key $"($env.HOME)/.abuseipdbkey.txt" "AbuseIPDB")
+# IP reputation via ISC SANS DShield (no API key required)
+def abuse [ip: string] {
     let target = ($ip | str trim)
-    if $target == "" { error make { msg: "ip cannot be empty." } }
+    if (($target | parse --regex '^(?:\d{1,3}\.){3}\d{1,3}$' | length) == 0) {
+        error make { msg: "abuse expects an IPv4 address." }
+    }
 
     let resp = (try {
-        http get --headers ["Key" $key "Accept" "application/json"] $"https://api.abuseipdb.com/api/v2/check?ipAddress=($target)&maxAgeInDays=($days)"
+        http get $"https://isc.sans.edu/api/ip/($target)?json"
     } catch { |err|
-        error make { msg: $"AbuseIPDB request failed (bad key/quota): ($err.msg)" }
+        error make { msg: $"DShield request failed: ($err.msg)" }
     })
 
-    let d = $resp.data
+    let d = ($resp.ip? | default {})
+    let attacks = ($d.attacks? | default null)
+    let reports = ($d.count? | default null)
     {
-        ip: ($d.ipAddress? | default $target)
-        abuseScore: ($d.abuseConfidenceScore? | default 0)
-        totalReports: ($d.totalReports? | default 0)
-        country: ($d.countryCode? | default "-")
-        isp: ($d.isp? | default "-")
-        domain: ($d.domain? | default "-")
-        usageType: ($d.usageType? | default "-")
-        isTor: ($d.isTor? | default false)
-        lastReported: ($d.lastReportedAt? | default "-")
+        ip: ($d.number? | default $target)
+        reports: (if $reports == null { 0 } else { $reports })
+        targets_attacked: (if $attacks == null { 0 } else { $attacks })
+        max_risk: ($d.maxrisk? | default "-")
+        as: ($d.as? | default "-")
+        asname: ($d.asname? | default "-")
+        country: ($d.ascountry? | default "-")
+        network: ($d.network? | default "-")
+        first_seen: ($d.mindate? | default "-")
+        last_seen: ($d.maxdate? | default "-")
+        abuse_contact: ($d.asabusecontact? | default "-")
     }
 }
 
-# AlienVault OTX general indicator lookup (IP, domain, hash, URL)
-def otx [ioc: string, --type: string] {
-    let key = (get-api-key $"($env.HOME)/.otxkey.txt" "AlienVault OTX")
-    let value = ($ioc | str trim)
+# Indicator lookup against the ThreatFox recent feed (no API key required)
+def otx [ioc: string] {
+    let value = ($ioc | str trim | str downcase)
     if $value == "" { error make { msg: "ioc cannot be empty." } }
-    let kind = if $type != null { ($type | str downcase) } else { (ioc-type $value) }
 
-    let section = if $kind == "ip" {
-        "IPv4"
-    } else if $kind == "domain" {
-        "domain"
-    } else if ($kind in ["hash" "file"]) {
-        "file"
-    } else if $kind == "url" {
-        "url"
-    } else {
-        error make { msg: $"Unsupported --type: ($kind). Use ip|domain|hash|url." }
-    }
-
-    let resp = (try {
-        http get --headers ["X-OTX-API-KEY" $key] $"https://otx.alienvault.com/api/v1/indicators/($section)/($value)/general"
+    let feed = (try {
+        http get "https://threatfox.abuse.ch/export/json/recent/"
     } catch { |err|
-        error make { msg: $"OTX request failed (bad key or IOC not found): ($err.msg)" }
+        error make { msg: $"ThreatFox feed request failed: ($err.msg)" }
     })
 
-    let pulses = ($resp.pulse_info.pulses? | default [])
-    {
-        ioc: $value
-        type: $section
-        pulse_count: ($resp.pulse_info.count? | default 0)
-        pulses: ($pulses | each { |p| $p.name? | default "-" } | first 5)
-        malware_families: ($resp.pulse_info.related?.alienvault?.malware_families? | default [])
-        country: ($resp.country_name? | default "-")
-        asn: ($resp.asn? | default "-")
+    let matches = ($feed
+        | values
+        | flatten
+        | where { |entry|
+            let hay = ([
+                ($entry.ioc_value? | default "")
+                ($entry.malware? | default "")
+                ($entry.malware_printable? | default "")
+                ($entry.threat_type? | default "")
+            ] | str join " " | into string | str downcase)
+            ($hay | str contains $value)
+        }
+        | each { |entry|
+            {
+                ioc: ($entry.ioc_value? | default "-")
+                ioc_type: ($entry.ioc_type? | default "-")
+                threat_type: ($entry.threat_type? | default "-")
+                malware: ($entry.malware_printable? | default ($entry.malware? | default "-"))
+                confidence: ($entry.confidence_level? | default "-")
+                first_seen: ($entry.first_seen_utc? | default "-")
+                reference: ($entry.reference? | default "-")
+            }
+        }
+        | uniq)
+
+    if (($matches | length) == 0) {
+        print $"(ansi yellow_bold)[otx](ansi reset) No match in ThreatFox recent feed for: ($ioc). \(feed is a rolling recent window\)"
     }
+    $matches
 }
 
 # Start HTTPSERVER
@@ -498,9 +522,9 @@ def hlp [command?: string, --verbose (-v)] {
     let summaries = {
         chkbgp: "Fetch ASN/BGP details for an IP."
         ipinfo: "Geolocate/enrich an IP or host (ip-api)."
-        vt: "VirusTotal lookup (IP/domain/hash/URL)."
-        abuse: "AbuseIPDB reputation check for an IP."
-        otx: "AlienVault OTX indicator lookup."
+        vt: "Key-free IOC reputation (hash/ip/domain/url)."
+        abuse: "IP reputation via ISC SANS DShield (no key)."
+        otx: "IOC lookup in ThreatFox recent feed (no key)."
         hs: "Start a quick HTTP file server."
         catt: "Show a file with syntax highlighting."
         ifc: "List network interfaces."
@@ -550,9 +574,9 @@ def hlp [command?: string, --verbose (-v)] {
     let samples = {
         chkbgp: "chkbgp 8.8.8.8"
         ipinfo: "ipinfo 8.8.8.8"
-        vt: "vt 8.8.8.8"
+        vt: "vt 44d88612fea8a8f36de82e1278abb02f"
         abuse: "abuse 45.83.12.9"
-        otx: "otx baddomain.com"
+        otx: "otx clearfake"
         hs: "hs --path /tmp/share"
         catt: "catt configs/config.nu"
         ifc: "ifc"
@@ -610,19 +634,18 @@ def hlp [command?: string, --verbose (-v)] {
             "tfox --dtype all"
         ]
         vt: [
-            "vt 8.8.8.8"
-            "vt 44d88612fea8a8f36de82e1278abb02f --type hash"
-            "vt evil.example.com"
-            "vt https://evil.example.com/payload --type url"
+            "vt 44d88612fea8a8f36de82e1278abb02f   # hash -> CIRCL hashlookup"
+            "vt 8.8.8.8                            # ip -> DShield"
+            "vt evil.example.com                   # domain -> urlscan.io"
+            "vt https://evil.example.com/x --type url"
         ]
         abuse: [
             "abuse 45.83.12.9"
-            "abuse 45.83.12.9 --days 30"
         ]
         otx: [
-            "otx baddomain.com"
-            "otx 45.83.12.9"
-            "otx 44d88612fea8a8f36de82e1278abb02f --type hash"
+            "otx clearfake        # by malware family name"
+            "otx 45.83.12.9        # by IP/domain/url substring"
+            "otx bad.example.com"
         ]
         triage: [
             "triage --family agenttesla --limit 5"
