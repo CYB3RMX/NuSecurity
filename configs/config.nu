@@ -2,7 +2,7 @@ $env.config.buffer_editor = "vim" # Can be anything for ex. (nvim, nano, ...)
 $env.config.show_banner = false
 
 # Ensure HOME exists on Windows sessions
-let is_windows = (($nu.os-info.name | str downcase) == "windows")
+let is_windows = (($nu.os-info.name | str lowercase) == "windows")
 if ($is_windows and ($env.HOME? == null) and ($env.USERPROFILE? != null)) {
     $env.HOME = $env.USERPROFILE
 }
@@ -15,7 +15,7 @@ let show_sysinfo = (try {
     } else if (($value | describe) == "bool") {
         $value
     } else {
-        let normalized = ($value | into string | str trim | str downcase)
+        let normalized = ($value | into string | str trim | str lowercase)
         $normalized in ["1", "true", "yes", "on"]
     }
 } catch {
@@ -106,7 +106,7 @@ def ioc-type [value: string] {
         or (($v | parse --regex '^[a-fA-F0-9]{64}$' | length) > 0)
     ) {
         "hash"
-    } else if ($v | str downcase | str starts-with "http") {
+    } else if ($v | str lowercase | str starts-with "http") {
         "url"
     } else {
         "domain"
@@ -121,7 +121,7 @@ def ioc-type [value: string] {
 def vt [ioc: string, --type: string] {
     let value = ($ioc | str trim)
     if $value == "" { error make { msg: "ioc cannot be empty." } }
-    let kind = if $type != null { ($type | str downcase) } else { (ioc-type $value) }
+    let kind = if $type != null { ($type | str lowercase) } else { (ioc-type $value) }
 
     if ($kind in ["hash" "file"]) {
         let algo = if (($value | str length) == 32) {
@@ -219,7 +219,7 @@ def abuse [ip: string] {
 
 # Indicator lookup against the ThreatFox recent feed (no API key required)
 def otx [ioc: string] {
-    let value = ($ioc | str trim | str downcase)
+    let value = ($ioc | str trim | str lowercase)
     if $value == "" { error make { msg: "ioc cannot be empty." } }
 
     let feed = (try {
@@ -237,7 +237,7 @@ def otx [ioc: string] {
                 ($entry.malware? | default "")
                 ($entry.malware_printable? | default "")
                 ($entry.threat_type? | default "")
-            ] | str join " " | into string | str downcase)
+            ] | str join " " | into string | str lowercase)
             ($hay | str contains $value)
         }
         | each { |entry|
@@ -303,7 +303,7 @@ def drmi [target_id: string] {
 
 # Install desired package
 def aget [target_package: string] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     let has_cmd = { |command: string|
         (try {
             let command_paths = (which --all $command | get path)
@@ -326,7 +326,7 @@ def aget [target_package: string] {
 
 # Remove package
 def arem [target_package: string] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     let has_cmd = { |command: string|
         (try {
             let command_paths = (which --all $command | get path)
@@ -349,7 +349,7 @@ def arem [target_package: string] {
 
 # List connections and listening ports
 def netcon [] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     let has_external_cmd = { |command: string|
         (try {
             let command_paths = (which --all $command | where type == "external" | get path)
@@ -398,7 +398,7 @@ def haus [
         })
     }
 
-    let normalized_type = ($datatype | str trim | str downcase)
+    let normalized_type = ($datatype | str trim | str lowercase)
     let source_type = if ($normalized_type in ["normal", "full"]) {
         "normal"
     } else if ($normalized_type in ["online", "active"]) {
@@ -432,23 +432,23 @@ def haus [
         }
 
         if ($contains != null) {
-            let needle = ($contains | str downcase)
-            $urls = ($urls | where { |u| ($u | str downcase | str contains $needle) })
+            let needle = ($contains | str lowercase)
+            $urls = ($urls | where { |u| ($u | str lowercase | str contains $needle) })
         }
 
         if ($host_contains != null) {
-            let needle = ($host_contains | str downcase)
+            let needle = ($host_contains | str lowercase)
             $urls = ($urls | where { |u|
                 let host = (do $url_host $u)
-                $host != null and ($host | str downcase | str contains $needle)
+                $host != null and ($host | str lowercase | str contains $needle)
             })
         }
 
         if ($host_ends_with != null) {
-            let suffix = ($host_ends_with | str downcase)
+            let suffix = ($host_ends_with | str lowercase)
             $urls = ($urls | where { |u|
                 let host = (do $url_host $u)
-                $host != null and ($host | str downcase | str ends-with $suffix)
+                $host != null and ($host | str lowercase | str ends-with $suffix)
             })
         }
 
@@ -898,7 +898,7 @@ def windows-evt-hunt [
     --since-hours: int = 24     # Search window in hours
     --limit: int = 200          # Max returned rows
 ] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     if ($is_windows == false) {
         error make { msg: "windows-evt-hunt can only run on Windows." }
     }
@@ -944,8 +944,8 @@ def persist-hunt [
     --contains: string  # Optional case-insensitive keyword filter
     --limit: int = 300  # Max returned rows
 ] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
-    let keyword = if $contains != null { ($contains | str downcase | str trim) } else { null }
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
+    let keyword = if $contains != null { ($contains | str lowercase | str trim) } else { null }
 
     if $is_windows {
         let safe_keyword = if $keyword != null {
@@ -1015,7 +1015,7 @@ def persist-hunt [
                 }
 
                 let path_text = ($path_item | into string)
-                let lc_path = ($path_text | str downcase)
+                let lc_path = ($path_text | str lowercase)
                 let category = if ($lc_path | str contains "/cron") {
                     "cron"
                 } else if ($lc_path | str contains "systemd") {
@@ -1043,7 +1043,7 @@ def persist-hunt [
                 let matches_keyword = if $keyword == null {
                     true
                 } else {
-                    (($path_text | str downcase | str contains $keyword) or ($clue | str downcase | str contains $keyword))
+                    (($path_text | str lowercase | str contains $keyword) or ($clue | str lowercase | str contains $keyword))
                 }
 
                 if $matches_keyword {
@@ -1072,8 +1072,8 @@ def proc-hunt [
     --min-score: int = 1 # Minimum heuristic score to keep
     --limit: int = 200   # Max returned rows
 ] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
-    let needle = if $contains != null { ($contains | str downcase | str trim) } else { null }
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
+    let needle = if $contains != null { ($contains | str lowercase | str trim) } else { null }
 
     let process_rows = if $is_windows {
         let raw = (powershell-text "Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name, CommandLine | ConvertTo-Json -Depth 4")
@@ -1106,7 +1106,7 @@ def proc-hunt [
     }
 
     let scored = ($process_rows | each { |proc|
-        let cmd = ($proc.cmdline | str downcase)
+        let cmd = ($proc.cmdline | str lowercase)
         mut score = 0
         mut reasons = []
 
@@ -1130,7 +1130,7 @@ def proc-hunt [
             $score = ($score + 3)
             $reasons ++= ["shell-tunneling"]
         }
-        if (($proc.name | str downcase) =~ '(python|bash|sh|powershell|cmd|wscript|cscript)') and ($cmd =~ '(http://|https://)') {
+        if (($proc.name | str lowercase) =~ '(python|bash|sh|powershell|cmd|wscript|cscript)') and ($cmd =~ '(http://|https://)') {
             $score = ($score + 1)
             $reasons ++= ["script-with-url"]
         }
@@ -1138,7 +1138,7 @@ def proc-hunt [
         let matches_needle = if $needle == null {
             true
         } else {
-            ((($proc.name | str downcase) | str contains $needle) or ($cmd | str contains $needle))
+            ((($proc.name | str lowercase) | str contains $needle) or ($cmd | str contains $needle))
         }
 
         if ($score >= $min_score and $matches_needle) {
@@ -1169,7 +1169,7 @@ def proc-dump [
     --count (-n): int = 1      # Number of dumps to capture
     --name: string             # Optional dump filename (defaults to auto-generated)
 ] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     if ($is_windows == false) {
         error make { msg: "proc-dump can only run on Windows." }
     }
@@ -1288,9 +1288,9 @@ def log-hunt [
     --since-hours: int = 24 # Journal/Event lookback in hours
     --limit: int = 300      # Max returned rows
 ] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     let default_pattern = "failed password|authentication failure|invalid user|sudo:|powershell|cmd.exe|wget|curl|base64|rundll32|mshta|certutil"
-    let needle = if $pattern != null { ($pattern | str trim | str downcase) } else { null }
+    let needle = if $pattern != null { ($pattern | str trim | str lowercase) } else { null }
     let auth_failure_hint = if $needle == null {
         true
     } else {
@@ -1356,7 +1356,7 @@ def log-hunt [
                 | lines
                 | enumerate
                 | where { |row|
-                    let line = ($row.item | str downcase)
+                    let line = ($row.item | str lowercase)
                     if $needle != null {
                         $line | str contains $needle
                     } else {
@@ -1381,7 +1381,7 @@ def log-hunt [
                 journalctl --since $"($since_hours) hours ago" --no-pager
                 | lines
                 | where { |line|
-                    let lc = ($line | str downcase)
+                    let lc = ($line | str lowercase)
                     if $needle != null {
                         $lc | str contains $needle
                     } else {
@@ -1410,12 +1410,12 @@ def timeline-lite [
         error make { msg: $"Path not found: ($target_path)" }
     }
 
-    let needle = if $contains != null { ($contains | str downcase | str trim) } else { null }
+    let needle = if $contains != null { ($contains | str lowercase | str trim) } else { null }
     mut files = (glob $"($target_path)/**")
     $files = ($files | where { |entry| (try { ($entry | path type) == "file" } catch { false }) })
 
     if $needle != null {
-        $files = ($files | where { |entry| (($entry | into string | str downcase) | str contains $needle) })
+        $files = ($files | where { |entry| (($entry | into string | str lowercase) | str contains $needle) })
     }
 
     let rows = ($files | each { |entry|
@@ -1478,7 +1478,7 @@ def upc [] {
 
 #System Cleaner
 def clean [] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     let has_cmd = { |command: string|
         (try {
             let command_paths = (which --all $command | get path)
@@ -1488,7 +1488,7 @@ def clean [] {
         })
     }
 
-    let confirm = (input $"(ansi red_bold)System cache will be cleaned. Are you sure? [Y/n]: (ansi reset)" | str trim | str downcase)
+    let confirm = (input $"(ansi red_bold)System cache will be cleaned. Are you sure? [Y/n]: (ansi reset)" | str trim | str lowercase)
     if $confirm == "y" or $confirm == "" {
         if $is_windows {
             if (do $has_cmd "powershell") {
@@ -1509,7 +1509,7 @@ def clean [] {
 
 # Get ARP/neighbor table with style!
 def arpt [] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     let has_external_cmd = { |command: string|
         (try {
             let command_paths = (which --all $command | where type == "external" | get path)
@@ -1537,7 +1537,7 @@ def arpt [] {
 
 # Search for target file in the system
 def ff [target_file: string] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     let has_cmd = { |command: string|
         (try {
             let command_paths = (which --all $command | get path)
@@ -1580,7 +1580,7 @@ def ff [target_file: string] {
 
 # List active and inactive services
 def serv [] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     if $is_windows {
         powershell -NoProfile -Command 'Get-Service | Select-Object Name,Status | Sort-Object Name'
         return
@@ -1602,7 +1602,7 @@ def serv [] {
 
 # List disk partitions (lsblk with style!)
 def dls [] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     let has_external_cmd = { |command: string|
         (try {
             let command_paths = (which --all $command | where type == "external" | get path)
@@ -1625,7 +1625,7 @@ def dls [] {
 
 # Format/fix USB or USB like devices
 def fixu [target_disk: string] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     if $is_windows {
         error make { msg: "fixu is disabled on Windows. Use Disk Management or diskpart carefully." }
     }
@@ -1723,7 +1723,7 @@ def rware [
 
     let fetch = { |selected_country_code?|
         if ($selected_country_code != null and (($selected_country_code | str trim) != "")) {
-            let code = ($selected_country_code | str trim | str upcase)
+            let code = ($selected_country_code | str trim | str uppercase)
             let data = (http get $"https://api.ransomware.live/v2/countryvictims/($code)" | to json | from json)
             $data | each { |d|
                 {
@@ -1904,7 +1904,7 @@ def triage [
     ]
 
     let benign_host = { |host: string|
-        let normalized = ($host | str downcase | str trim)
+        let normalized = ($host | str lowercase | str trim)
         (($known_benign | where { |item|
             ($normalized == $item) or ($normalized | str ends-with $".($item)")
         } | length) > 0)
@@ -1924,7 +1924,7 @@ def triage [
     }
 
     let suspicious_host = { |host: string|
-        let normalized = ($host | str downcase | str trim)
+        let normalized = ($host | str lowercase | str trim)
         if $normalized == "" {
             false
         } else if (do $benign_host $normalized) {
@@ -2017,7 +2017,7 @@ def triage [
         })
 
         let download_urls = ($raw_urls | where { |u|
-            ($u | str downcase) =~ '\.(bin|exe|dll|dat|ps1|vbs|scr|bat|cmd|zip|rar|7z|hta|msi|jar)(\?|$)'
+            ($u | str lowercase) =~ '\.(bin|exe|dll|dat|ps1|vbs|scr|bat|cmd|zip|rar|7z|hta|msi|jar)(\?|$)'
         })
 
         let download_hosts = ($download_urls | each { |u| do $url_host $u } | where { |h| $h != null and ($h | str trim) != "" })
@@ -2142,7 +2142,7 @@ def triage [
                 }
                 | flatten
                 | each { |entry| $entry | str trim }
-                | where { |entry| ($entry | str downcase | str starts-with "http") }
+                | where { |entry| ($entry | str lowercase | str starts-with "http") }
             } catch {
                 []
             })
@@ -2203,7 +2203,7 @@ def triage [
             $cred_block
             | parse --regex '(?s)<li class="nano"><b>(?:<br>)?([^<:]+):\s*</b>(.*?)</li>'
             | each { |row|
-                let k = (do $clean_html_text $row.capture0 | str downcase)
+                let k = (do $clean_html_text $row.capture0 | str lowercase)
                 let v = (do $clean_html_text $row.capture1)
                 if ($k != "" and $v != "") { $"($k)=($v)" } else { null }
             }
