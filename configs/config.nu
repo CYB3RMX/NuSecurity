@@ -434,14 +434,24 @@ def threatfox-cache [--refresh, --ttl-hours: int = 6] {
 # Indicator/malware lookup against the ThreatFox export (no API key required).
 # Default searches the full export (cached 6h); --recent uses the small live feed.
 def otx [
-    ioc: string        # IP/domain/URL/hash substring OR malware family name
+    ioc?: string       # IP/domain/URL/hash substring OR malware family name
     --recent           # Search only the recent rolling feed (faster, less coverage)
     --refresh          # Force refresh of the cached full export
     --cc: string       # Keep only IOCs in this country (e.g. TR); geolocates IPs + ccTLD domains
     --limit: int = 50  # Max rows returned
 ] {
+    # `otx --refresh` with no IOC just refreshes the cached export and exits.
+    if ($ioc == null or (($ioc | str trim) == "")) {
+        if $refresh {
+            let path = (threatfox-cache --refresh)
+            let count = (open $path | values | flatten | length)
+            print $"(ansi green_bold)[otx](ansi reset) ThreatFox full export refreshed: ($count) IOCs cached."
+            return
+        }
+        error make { msg: "Provide an IOC/family to search, or use `otx --refresh` to just refresh the cache." }
+    }
+
     let raw_needle = ($ioc | str trim | str lowercase)
-    if $raw_needle == "" { error make { msg: "ioc cannot be empty." } }
     let norm_needle = ($raw_needle | str replace --all --regex '[ ._-]' '')
 
     let entries = if $recent {
