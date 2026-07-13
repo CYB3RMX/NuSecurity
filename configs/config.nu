@@ -889,56 +889,148 @@ def hlp [command?: string, --verbose (-v)] {
     }
 
     let examples = {
-        haus: [
-            "haus normal --limit 20"
-            "haus --host-only --contains \"in.net\" --limit 10"
-            "haus --host-ends-with \".tr\" --host-only --limit 20"
-            "haus online --cc TR --host-only   # only IOCs geolocated to Turkey"
+        chkbgp: [
+            "chkbgp 8.8.8.8            # ASN / prefix / RIR details for an IP"
         ]
-        tfox: [
-            "tfox --dtype url"
-            "tfox --dtype all"
-            "tfox --dtype all --cc TR   # only Turkey-based IOCs"
-        ]
-        vrb: [
-            "vrb"
-            "vrb --cc TR   # only Turkey-based C2 panels"
-        ]
-        pls: [
-            "pls"
-            "pls --cc TR   # only Turkish proxies"
+        ipinfo: [
+            "ipinfo 8.8.8.8           # geo + ISP/ASN + reverse DNS"
+            "ipinfo example.com       # resolve + enrich a hostname"
         ]
         vt: [
             "vt aadfc11ee472ecd3e8dae7acde9233dac75acfa7   # hash -> ThreatFox + Cymru MHR"
             "vt 160.20.109.75                     # ip -> ThreatFox + DShield + geo"
             "vt evil.example.com                  # domain -> ThreatFox + urlscan.io"
-            "vt https://evil.example.com/x --type url"
+            "vt https://evil.example.com/x --type url   # force type when auto-detect is wrong"
         ]
         abuse: [
-            "abuse 45.83.12.9"
+            "abuse 45.83.12.9         # IP reputation via ISC SANS DShield"
         ]
         otx: [
-            "otx agenttesla        # by malware family name (full export)"
-            "otx 45.83.12.9        # by IP/domain/url substring"
-            "otx cobaltstrike --cc TR   # only Turkey-based C2s"
-            "otx remcos --recent   # fast, recent feed only"
-            "otx formbook --refresh # force-refresh cached full export"
+            "otx agenttesla           # by malware family name (full export)"
+            "otx 45.83.12.9           # by IP/domain/url substring"
+            "otx cobaltstrike --cc TR # only Turkey-based C2s"
+            "otx remcos --recent      # fast, recent feed only"
+            "otx --refresh            # just refresh the cached full export"
         ]
-        triage: [
-            "triage --family agenttesla --limit 5"
-            "triage --family remcos --limit 3"
-            "triage --query \"sha1:...\" --limit 3 --no-c2 --no-config"
-            "triage --query \"sha256:...\" --limit 1 | get 0.MalwareConfig"
+        hs: [
+            "hs                       # serve current dir on :8000"
+            "hs --path /tmp/share     # serve a specific folder"
         ]
-        rware: [
-            "rware tr --limit 20"
-            "rware --limit 20"
-            "rware tr --monitor --interval 30 --max-cycles 20"
+        catt: [
+            "catt configs/config.nu   # print a file with syntax highlighting"
+        ]
+        ifc: [ "ifc                      # list network interfaces + addresses" ]
+        sd: [ "sd                       # list disks (size, model, mount)" ]
+        lsv: [ "lsv                      # ls sorted by size (biggest last)" ]
+        lsl: [ "lsl                      # ls sorted by modified time + mime" ]
+        dosh: [ "dosh ubuntu:24.04        # drop into bash inside an image" ]
+        drmi: [ "drmi 3a1b2c4d5e6f        # force-remove an image by id" ]
+        aget: [ "aget nmap                # install a package (apt / winget)" ]
+        arem: [ "arem nmap                # remove a package (apt / winget)" ]
+        netcon: [ "netcon                   # IPv4 connections + listening ports" ]
+        vrb: [
+            "vrb                      # latest 50 C2 panels (Viriback)"
+            "vrb --cc TR              # only Turkey-based C2 panels"
+        ]
+        haus: [
+            "haus normal --limit 20              # newest 20 malware URLs"
+            "haus --host-only --contains in.net --limit 10   # unique hosts matching a string"
+            "haus --host-ends-with .tr --host-only --limit 20 # only .tr hosts"
+            "haus online --cc TR --host-only     # only IOCs geolocated to Turkey"
+        ]
+        tfox: [
+            "tfox --dtype url         # recent IOC URLs only"
+            "tfox --dtype all         # full records (malware, tags, refs)"
+            "tfox --dtype all --cc TR # only Turkey-based IOCs"
+        ]
+        hx: [
+            "hx subdomains.txt        # httpx probe a list (status/title/tech)"
+        ]
+        pdsc: [
+            "pdsc nuclei              # go install a ProjectDiscovery tool"
+            "pdsc subfinder"
+        ]
+        hlp: [
+            "hlp                      # list all project commands"
+            "hlp -v                   # verbose: usage + params for each"
+            "hlp otx                  # full detail + examples for one command"
+        ]
+        shx: [ "shx example.com          # subfinder | httpx (live subdomains)" ]
+        bdc: [
+            "bdc SGVsbG8=             # base64 decode"
+            "bdc -e 'Hello World'     # base64 encode"
+        ]
+        defang: [
+            "defang https://evil.example.com/x   # -> hxxps://evil[.]example[.]com/x"
+        ]
+        refang: [
+            "refang hxxps://evil[.]example[.]com # -> https://evil.example.com"
+        ]
+        hashf: [
+            "hashf suspicious.bin     # md5 + sha1 + sha256 + size of a file"
+        ]
+        hdns: [
+            "hdns suspicious-domain.com  # pivot to related C2 domains (hedns)"
+        ]
+        "windows-evt-hunt": [
+            "windows-evt-hunt --log Security --event-id 4625 --since-hours 24   # failed logons"
+            "windows-evt-hunt --log System --contains error --since-hours 12"
+        ]
+        "persist-hunt": [
+            "persist-hunt                    # dump autostart/persistence points"
+            "persist-hunt --contains cron --limit 50   # filter by keyword"
+        ]
+        "proc-hunt": [
+            "proc-hunt                       # score all processes"
+            "proc-hunt --min-score 2 --limit 50   # only suspicious ones"
+            "proc-hunt --contains powershell"
         ]
         "proc-dump": [
-            "proc-dump lsass --out-dir C:\\dumps"
-            "proc-dump ollama.exe --out-dir C:\\dumps --mini"
-            "proc-dump notepad.exe --out-dir C:\\dumps --full"
+            "proc-dump lsass --out-dir C:\\dumps          # full memory dump (Windows)"
+            "proc-dump notepad.exe --out-dir C:\\dumps --mini"
+            "proc-dump 4242 --out-dir C:\\dumps --full    # by PID"
+        ]
+        "log-hunt": [
+            "log-hunt                        # scan auth/syslog for common IOCs"
+            "log-hunt \"failed password\" --since-hours 24 --limit 100"
+        ]
+        "timeline-lite": [
+            "timeline-lite /var/tmp                     # files by mtime"
+            "timeline-lite /var/tmp --with-hash --limit 100   # add sha256"
+        ]
+        upc: [ "upc                      # pull latest config.nu from GitHub" ]
+        clean: [ "clean                    # apt autoremove/autoclean + cache purge" ]
+        arpt: [ "arpt                     # ARP/neighbor table (IP + MAC + iface)" ]
+        ff: [
+            "ff sshd_config           # find a file by name, system-wide"
+            "ff .env"
+        ]
+        serv: [ "serv                     # active/inactive status of services" ]
+        dls: [ "dls                      # list block devices/partitions (lsblk)" ]
+        fixu: [
+            "fixu /dev/sdb1           # WIPE + format a USB as FAT32 (careful!)"
+        ]
+        yrs: [
+            "yrs suspicious.bin       # YARA-scan a file (auto-fetches rules)"
+        ]
+        rware: [
+            "rware                    # global recent ransomware victims"
+            "rware tr --limit 20      # victims in a country"
+            "rware tr --monitor --interval 30 --max-cycles 20   # live watch"
+        ]
+        pls: [
+            "pls                      # proxy list with geo/ISP"
+            "pls --cc TR              # only Turkish proxies"
+        ]
+        crt: [ "crt example.com          # subdomains from crt.sh (fast, no httpx)" ]
+        rip: [ "rip 1.1.1.1              # reverse-IP: other domains on that host" ]
+        dchr: [ "dchr example.com         # historical A records for a domain" ]
+        gf: [ "gf https://example.com/open/   # list file names in an open dir" ]
+        triage: [
+            "triage --family remcos --limit 3          # recent reports for a family"
+            "triage --family agenttesla --limit 5"
+            "triage --query \"sha256:...\" --limit 1 | get 0.MalwareConfig   # pull config"
+            "triage --query \"sha1:...\" --limit 3 --no-c2 --no-config"
         ]
     }
 
