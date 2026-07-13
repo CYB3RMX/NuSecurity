@@ -193,71 +193,154 @@ def geo-filter [
     } | where { |x| $x != null }
 }
 
-# Reputation lookup for any IOC using key-free sources.
-#   hash   -> CIRCL hashlookup (KnownMalicious flag + file metadata)
-#   ip     -> ISC SANS DShield (attack/report counts)
-#   domain -> urlscan.io recent scans + malicious verdict count
-#   url    -> urlscan.io recent scans for the URL
+# Team Cymru Malware Hash Registry lookup via DNS (no key; md5/sha1 only)
+def cymru-mhr [hash: string] {
+    let h = ($hash | str trim | str lowercase)
+    let len = ($h | str length)
+    if ($len != 32 and $len != 40) {
+        return { supported: false, known: false, detection_pct: null, last_seen: "-" }
+    }
+    let has_dig = (try { (which dig | where type == "external" | length) > 0 } catch { false })
+    let raw = if $has_dig {
+        (try { ^dig +short TXT $"($h).malware.hash.cymru.com" | complete | get stdout } catch { "" })
+    } else {
+        (try { ^nslookup -type=TXT $"($h).malware.hash.cymru.com" | complete | get stdout } catch { "" })
+    }
+    let m = ($raw | str replace --all '"' '' | parse --regex '(?<epoch>\d{9,})\s+(?<pct>\d{1,3})')
+    if (($m | length) == 0) {
+        { supported: true, known: false, detection_pct: null, last_seen: "-" }
+    } else {
+        let epoch = (try { $m | get epoch.0 | into int } catch { 0 })
+        let pct = (try { $m | get pct.0 | into int } catch { 0 })
+        let seen = (try { ($epoch * 1_000_000_000) | into datetime | format date "%Y-%m-%d" } catch { "-" })
+        { supported: true, known: true, detection_pct: $pct, last_seen: $seen }
+    }
+}
+
+# Find an exact IOC in the cached ThreatFox full export (no key). Returns record or null.
+def threatfox-find [value: string, kind: string] {
+    let path = (threatfox-cache)
+    let v = ($value | str trim | str lowercase)
+    let hits = (open $path | values | flatten | where { |e|
+        let iv = ($e.ioc_value? | default "" | into string | str lowercase)
+        if $kind == "ip" {
+            ($iv == $v) or ($iv | str starts-with $"($v):")
+        } else if $kind == "domain" {
+            ($iv == $v) or ((ioc-host $iv) == $v)
+        } else if $kind == "url" {
+            $iv == $v
+        } else {
+            $iv == $v
+        }
+    })
+    let hit = ($hits | get 0?)
+    if ($hit == null) {
+        null
+    } else {
+        {
+            malware: ($hit.malware_printable? | default ($hit.malware? | default "-"))
+            threat_type: ($hit.threat_type? | default "-")
+            ioc_type: ($hit.ioc_type? | default "-")
+            first_seen: ($hit.first_seen_utc? | default "-")
+            reference: ($hit.reference? | default "-")
+        }
+    }
+}
+
+# Aggregate key-free IOC reputation from multiple sources.
+#   hash   -> ThreatFox export + Team Cymru MHR (AV %) + CIRCL hashlookup
+#   ip     -> ThreatFox export + ISC SANS DShield + ip-api (geo/hosting/proxy)
+#   domain -> ThreatFox export + urlscan.io
+#   url    -> ThreatFox export + urlscan.io
 def vt [ioc: string, --type: string] {
     let value = ($ioc | str trim)
     if $value == "" { error make { msg: "ioc cannot be empty." } }
     let kind = if $type != null { ($type | str lowercase) } else { (ioc-type $value) }
 
     if ($kind in ["hash" "file"]) {
-        let algo = if (($value | str length) == 32) {
-            "md5"
-        } else if (($value | str length) == 40) {
-            "sha1"
-        } else if (($value | str length) == 64) {
-            "sha256"
-        } else {
+        let len = ($value | str length)
+        let algo = if $len == 32 { "md5" } else if $len == 40 { "sha1" } else if $len == 64 { "sha256" } else {
             error make { msg: "hash must be md5(32), sha1(40) or sha256(64) hex chars." }
         }
-        let resp = (try {
-            http get $"https://hashlookup.circl.lu/lookup/($algo)/($value)"
-        } catch {
-            null
-        })
-        if ($resp == null or ($resp.message? | default "") =~ "(?i)not found") {
-            {
-                ioc: $value
-                type: "hash"
-                source: "circl-hashlookup"
-                known: false
-                verdict: "unknown (not in dataset)"
-                filename: "-"
-                filesize: "-"
-            }
+        let tf = (threatfox-find $value "hash")
+        let cymru = (cymru-mhr $value)
+        let circl = (try { http get $"https://hashlookup.circl.lu/lookup/($algo)/($value)" } catch { null })
+        let circl_known = ($circl != null and (($circl.message? | default "") !~ "(?i)not found"))
+
+        let verdict = if ($tf != null or $cymru.known) {
+            "MALICIOUS"
+        } else if $circl_known {
+            "known / likely benign"
         } else {
-            let malicious_src = ($resp.KnownMalicious? | default "")
-            {
-                ioc: $value
-                type: "hash"
-                source: "circl-hashlookup"
-                known: true
-                verdict: (if $malicious_src != "" { $"malicious \(($malicious_src)\)" } else { "known / likely benign (NSRL)" })
-                filename: ($resp.FileName? | default "-")
-                filesize: ($resp.FileSize? | default "-")
-            }
+            "unknown (no source has it)"
+        }
+
+        {
+            ioc: $value
+            type: $algo
+            verdict: $verdict
+            threatfox: (if $tf != null { $tf.malware } else { "-" })
+            threat_type: (if $tf != null { $tf.threat_type } else { "-" })
+            cymru_av: (if $cymru.known { $"($cymru.detection_pct)% \(seen ($cymru.last_seen)\)" } else { "-" })
+            circl_name: (if $circl_known { ($circl.FileName? | default "-") } else { "-" })
+            first_seen: (if $tf != null { $tf.first_seen } else { "-" })
         }
     } else if $kind == "ip" {
-        abuse $value
+        let tf = (threatfox-find $value "ip")
+        let ds = (abuse $value)
+        let geo = (try { ipinfo $value } catch { null })
+        let reports = (try { $ds.reports | into int } catch { 0 })
+
+        let verdict = if $tf != null {
+            "MALICIOUS"
+        } else if ($reports > 0) {
+            "suspicious (DShield reports)"
+        } else {
+            "no known reports"
+        }
+
+        {
+            ioc: $value
+            type: "ip"
+            verdict: $verdict
+            threatfox: (if $tf != null { $tf.malware } else { "-" })
+            threat_type: (if $tf != null { $tf.threat_type } else { "-" })
+            dshield_reports: $reports
+            country: ($ds.country? | default "-")
+            asname: ($ds.asname? | default "-")
+            isp: (if $geo != null { ($geo.isp? | default "-") } else { "-" })
+            hosting: (if $geo != null { ($geo.hosting? | default "-") } else { "-" })
+            proxy: (if $geo != null { ($geo.proxy? | default "-") } else { "-" })
+            first_seen: (if $tf != null { $tf.first_seen } else { "-" })
+        }
     } else if ($kind in ["domain" "url"]) {
+        let tf = (threatfox-find $value $kind)
         let query = if $kind == "domain" { $"domain:($value)" } else { $"page.url:\"($value)\"" }
         let resp = (try {
             http get $"https://urlscan.io/api/v1/search/?q=($query)&size=100"
-        } catch { |err|
-            error make { msg: $"urlscan.io request failed: ($err.msg)" }
+        } catch {
+            null
         })
-        let results = ($resp.results? | default [])
+        let results = (if $resp != null { ($resp.results? | default []) } else { [] })
         let malicious = ($results | where { |r| ($r.verdicts?.overall?.malicious? | default false) } | length)
         let tags = ($results | each { |r| $r.task?.tags? | default [] } | flatten | uniq | first 10)
+
+        let verdict = if $tf != null {
+            "MALICIOUS"
+        } else if ($malicious > 0) {
+            "suspicious (urlscan verdict)"
+        } else {
+            "no known reports"
+        }
+
         {
             ioc: $value
             type: $kind
-            source: "urlscan.io"
-            total_scans: ($results | length)
-            malicious_scans: $malicious
+            verdict: $verdict
+            threatfox: (if $tf != null { $tf.malware } else { "-" })
+            threat_type: (if $tf != null { $tf.threat_type } else { "-" })
+            urlscan_scans: ($results | length)
+            urlscan_malicious: $malicious
             tags: $tags
             last_scan: (try { $results | get 0.task.time } catch { "-" })
         }
@@ -694,7 +777,7 @@ def hlp [command?: string, --verbose (-v)] {
     let summaries = {
         chkbgp: "Fetch ASN/BGP details for an IP."
         ipinfo: "Geolocate/enrich an IP or host (ip-api)."
-        vt: "Key-free IOC reputation (hash/ip/domain/url)."
+        vt: "Aggregated key-free IOC reputation (ThreatFox+Cymru+urlscan)."
         abuse: "IP reputation via ISC SANS DShield (no key)."
         otx: "IOC/family lookup in ThreatFox full export (no key)."
         hs: "Start a quick HTTP file server."
@@ -816,9 +899,9 @@ def hlp [command?: string, --verbose (-v)] {
             "pls --cc TR   # only Turkish proxies"
         ]
         vt: [
-            "vt 44d88612fea8a8f36de82e1278abb02f   # hash -> CIRCL hashlookup"
-            "vt 8.8.8.8                            # ip -> DShield"
-            "vt evil.example.com                   # domain -> urlscan.io"
+            "vt aadfc11ee472ecd3e8dae7acde9233dac75acfa7   # hash -> ThreatFox + Cymru MHR"
+            "vt 160.20.109.75                     # ip -> ThreatFox + DShield + geo"
+            "vt evil.example.com                  # domain -> ThreatFox + urlscan.io"
             "vt https://evil.example.com/x --type url"
         ]
         abuse: [
