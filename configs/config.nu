@@ -217,28 +217,91 @@ def abuse [ip: string] {
     }
 }
 
-# Indicator lookup against the ThreatFox recent feed (no API key required)
-def otx [ioc: string] {
-    let value = ($ioc | str trim | str lowercase)
-    if $value == "" { error make { msg: "ioc cannot be empty." } }
+# Download + cache the full ThreatFox export (no API key). Returns the JSON path.
+def threatfox-cache [--refresh, --ttl-hours: int = 6] {
+    let has_external_cmd = { |command: string|
+        (try {
+            let command_paths = (which --all $command | where type == "external" | get path)
+            (($command_paths | where { |candidate| ($candidate | str trim) != "" and ($candidate | path exists) } | length) > 0)
+        } catch {
+            false
+        })
+    }
 
-    let feed = (try {
-        http get "https://threatfox.abuse.ch/export/json/recent/"
-    } catch { |err|
-        error make { msg: $"ThreatFox feed request failed: ($err.msg)" }
+    let cache_dir = ([$env.HOME ".nusecurity" "cache"] | path join)
+    mkdir $cache_dir
+    let json_path = ([$cache_dir "threatfox_full.json"] | path join)
+    let zip_path = ([$cache_dir "threatfox_full.zip"] | path join)
+
+    let is_fresh = (if ($json_path | path exists) {
+        let age = ((date now) - (ls $json_path | get 0.modified))
+        $age < ($ttl_hours * 1hr)
+    } else {
+        false
     })
 
-    let matches = ($feed
-        | values
-        | flatten
+    if ($refresh or (not $is_fresh)) {
+        print $"(ansi cyan_bold)[otx](ansi reset) Refreshing ThreatFox full export \(cached ($ttl_hours)h\) ..."
+        try {
+            http get "https://threatfox.abuse.ch/export/json/full/" | save --force --raw $zip_path
+        } catch { |err|
+            error make { msg: $"ThreatFox full export download failed: ($err.msg)" }
+        }
+
+        let extracted = ([$cache_dir "full.json"] | path join)
+        if ($extracted | path exists) { rm -f $extracted }
+
+        if (do $has_external_cmd "unzip") {
+            ^unzip -o -q -d $cache_dir $zip_path
+        } else {
+            # Cross-platform fallback via Python's stdlib zipfile
+            run-external (py-bin) "-m" "zipfile" "-e" $zip_path $cache_dir
+        }
+
+        if (($extracted | path exists) == false) {
+            error make { msg: "ThreatFox export extracted but full.json not found." }
+        }
+        mv -f $extracted $json_path
+        rm -f $zip_path
+    }
+
+    $json_path
+}
+
+# Indicator/malware lookup against the ThreatFox export (no API key required).
+# Default searches the full export (cached 6h); --recent uses the small live feed.
+def otx [
+    ioc: string        # IP/domain/URL/hash substring OR malware family name
+    --recent           # Search only the recent rolling feed (faster, less coverage)
+    --refresh          # Force refresh of the cached full export
+    --limit: int = 50  # Max rows returned
+] {
+    let raw_needle = ($ioc | str trim | str lowercase)
+    if $raw_needle == "" { error make { msg: "ioc cannot be empty." } }
+    let norm_needle = ($raw_needle | str replace --all --regex '[ ._-]' '')
+
+    let entries = if $recent {
+        let feed = (try {
+            http get "https://threatfox.abuse.ch/export/json/recent/"
+        } catch { |err|
+            error make { msg: $"ThreatFox feed request failed: ($err.msg)" }
+        })
+        $feed | values | flatten
+    } else {
+        let path = (if $refresh { threatfox-cache --refresh } else { threatfox-cache })
+        open $path | values | flatten
+    }
+
+    let matches = ($entries
         | where { |entry|
-            let hay = ([
-                ($entry.ioc_value? | default "")
+            let iocv = ($entry.ioc_value? | default "" | into string | str lowercase)
+            let names = ([
                 ($entry.malware? | default "")
+                ($entry.malware_alias? | default "")
                 ($entry.malware_printable? | default "")
                 ($entry.threat_type? | default "")
-            ] | str join " " | into string | str lowercase)
-            ($hay | str contains $value)
+            ] | str join " " | into string | str lowercase | str replace --all --regex '[ ._-]' '')
+            ($iocv | str contains $raw_needle) or (($norm_needle != "") and ($names | str contains $norm_needle))
         }
         | each { |entry|
             {
@@ -248,15 +311,17 @@ def otx [ioc: string] {
                 malware: ($entry.malware_printable? | default ($entry.malware? | default "-"))
                 confidence: ($entry.confidence_level? | default "-")
                 first_seen: ($entry.first_seen_utc? | default "-")
+                last_seen: ($entry.last_seen_utc? | default "-")
                 reference: ($entry.reference? | default "-")
             }
         }
         | uniq)
 
+    let source = if $recent { "recent feed" } else { "full export" }
     if (($matches | length) == 0) {
-        print $"(ansi yellow_bold)[otx](ansi reset) No match in ThreatFox recent feed for: ($ioc). \(feed is a rolling recent window\)"
+        print $"(ansi yellow_bold)[otx](ansi reset) No match in ThreatFox ($source) for: ($ioc)."
     }
-    $matches
+    if $limit > 0 { $matches | first $limit } else { $matches }
 }
 
 # Start HTTPSERVER
@@ -524,7 +589,7 @@ def hlp [command?: string, --verbose (-v)] {
         ipinfo: "Geolocate/enrich an IP or host (ip-api)."
         vt: "Key-free IOC reputation (hash/ip/domain/url)."
         abuse: "IP reputation via ISC SANS DShield (no key)."
-        otx: "IOC lookup in ThreatFox recent feed (no key)."
+        otx: "IOC/family lookup in ThreatFox full export (no key)."
         hs: "Start a quick HTTP file server."
         catt: "Show a file with syntax highlighting."
         ifc: "List network interfaces."
@@ -576,7 +641,7 @@ def hlp [command?: string, --verbose (-v)] {
         ipinfo: "ipinfo 8.8.8.8"
         vt: "vt 44d88612fea8a8f36de82e1278abb02f"
         abuse: "abuse 45.83.12.9"
-        otx: "otx clearfake"
+        otx: "otx agenttesla"
         hs: "hs --path /tmp/share"
         catt: "catt configs/config.nu"
         ifc: "ifc"
@@ -643,9 +708,11 @@ def hlp [command?: string, --verbose (-v)] {
             "abuse 45.83.12.9"
         ]
         otx: [
-            "otx clearfake        # by malware family name"
+            "otx agenttesla        # by malware family name (full export)"
             "otx 45.83.12.9        # by IP/domain/url substring"
             "otx bad.example.com"
+            "otx remcos --recent   # fast, recent feed only"
+            "otx formbook --refresh # force-refresh cached full export"
         ]
         triage: [
             "triage --family agenttesla --limit 5"
