@@ -42,6 +42,25 @@ Enable it with:
 $env.NUSECURITY_SHOW_SYSINFO = true
 ```
 
+## One-shot IOC report (`iocall`)
+`iocall <ioc>` auto-detects a URL / domain / IP / hash and pulls everything from
+the key-free sources into a single sectioned report with a 0-100 threat score:
+```nu
+iocall 160.20.109.75              # ip: score + VT engines + DNSBL + ports + related domains + C2 hits
+iocall evil.example.com           # domain: reputation + VT + DNS + RDAP + crt.sh subdomains + resolved-IP geo/DNSBL
+iocall https://bad.site/payload   # url: reputation + host VT/DNS/geo/RDAP + defanged form
+iocall <sha256>                   # hash: ThreatFox + Cymru MHR + CIRCL + VT engines
+iocall 160.20.109.75 --skip-ports # skip the TCP port scan (faster)
+iocall evil.example.com --json    # structured record for piping/export
+```
+Sources (all key-free): ThreatFox export, Team Cymru MHR, CIRCL hashlookup,
+ISC SANS DShield, ip-api, urlscan.io, RDAP, `dig`, HackerTarget + crt.sh +
+VirusTotal passive resolutions (related domains), a curated DNSBL set, and the
+VirusTotal UI endpoint for multi-engine verdicts. The VT endpoint is best-effort
+and rate-limits quickly (shown as `available: false` when blocked). An IP report
+runs a TCP port scan and several lookups, so it can take ~30s; use `--skip-ports`
+or `--json` to speed it up.
+
 ## Threat Intelligence (no API key)
 ```nu
 vt aadfc11ee472ecd3e8dae7acde9233dac75acfa7  # hash reputation (ThreatFox + Cymru MHR + CIRCL)
