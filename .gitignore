@@ -1,0 +1,18 @@
+# Claude Code local settings
+.claude/
+**/.claude/
+
+# Local API keys / secrets (kept in $HOME, never commit if copied here)
+.whoisxmlkey.txt
+.vtkey.txt
+.abuseipdbkey.txt
+.otxkey.txt
+*key*.txt
+
+# NuSecurity local cache (ThreatFox export, etc.)
+.nusecurity/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~

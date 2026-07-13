@@ -2,7 +2,7 @@ $env.config.buffer_editor = "vim" # Can be anything for ex. (nvim, nano, ...)
 $env.config.show_banner = false
 
 # Ensure HOME exists on Windows sessions
-let is_windows = (($nu.os-info.name | str downcase) == "windows")
+let is_windows = (($nu.os-info.name | str lowercase) == "windows")
 if ($is_windows and ($env.HOME? == null) and ($env.USERPROFILE? != null)) {
     $env.HOME = $env.USERPROFILE
 }
@@ -15,7 +15,7 @@ let show_sysinfo = (try {
     } else if (($value | describe) == "bool") {
         $value
     } else {
-        let normalized = ($value | into string | str trim | str downcase)
+        let normalized = ($value | into string | str trim | str lowercase)
         $normalized in ["1", "true", "yes", "on"]
     }
 } catch {
@@ -68,19 +68,457 @@ def chkbgp [ipaddr: string] {
     }
 }
 
+# Resolve an available Python interpreter (prefers python3)
+def py-bin [] {
+    for candidate in ["python3" "python"] {
+        let found = (try {
+            let command_paths = (which --all $candidate | where type == "external" | get path)
+            (($command_paths | where { |p| ($p | str trim) != "" and ($p | path exists) } | length) > 0)
+        } catch {
+            false
+        })
+        if $found { return $candidate }
+    }
+    error make { msg: "Python not found. Install python3 (or python) first." }
+}
+
+# Geolocate and enrich an IP or host (ip-api.com, no API key required)
+def ipinfo [target: string] {
+    if (($target | str trim) == "") {
+        error make { msg: "target cannot be empty." }
+    }
+    let fields = "status,message,query,continent,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as,asname,reverse,mobile,proxy,hosting"
+    let data = (http get $"http://ip-api.com/json/($target | str trim)?fields=($fields)")
+    if ($data.status? == "fail") {
+        error make { msg: $"ip-api error: ($data.message? | default 'unknown')" }
+    }
+    $data
+}
+
+# Best-effort classification of an IOC string
+def ioc-type [value: string] {
+    let v = ($value | str trim)
+    if (($v | parse --regex '^(?:\d{1,3}\.){3}\d{1,3}$' | length) > 0) {
+        "ip"
+    } else if (
+        (($v | parse --regex '^[a-fA-F0-9]{32}$' | length) > 0)
+        or (($v | parse --regex '^[a-fA-F0-9]{40}$' | length) > 0)
+        or (($v | parse --regex '^[a-fA-F0-9]{64}$' | length) > 0)
+    ) {
+        "hash"
+    } else if ($v | str lowercase | str starts-with "http") {
+        "url"
+    } else {
+        "domain"
+    }
+}
+
+# Extract the bare host/IP from an IOC value (url, ip:port, domain, ip)
+def ioc-host [value: string] {
+    mut h = ($value | str trim | str lowercase)
+    $h = ($h | str replace --regex '^[a-z0-9+.-]+://' '')   # strip scheme
+    $h = ($h | split row '/' | first)                        # strip path
+    $h = ($h | split row '?' | first)                        # strip query
+    $h = ($h | split row '@' | last)                         # strip userinfo
+    $h = ($h | str replace --regex ':[0-9]+$' '')            # strip :port
+    $h = ($h | str trim --char '[' | str trim --char ']')    # strip ipv6 brackets
+    $h
+}
+
+# Batch-geolocate IPs via ip-api.com (no key). Returns a table {ip, cc, country, isp}.
+def geo-batch [ips: list<string>] {
+    mut rows = []
+    for chunk in ($ips | uniq | chunks 100) {
+        let resp = (try {
+            http post --content-type application/json "http://ip-api.com/batch?fields=status,query,countryCode,country,isp" $chunk
+        } catch {
+            []
+        })
+        for r in $resp {
+            if (($r.status? | default "") == "success") {
+                $rows ++= [{
+                    ip: ($r.query? | default "")
+                    cc: ($r.countryCode? | default "")
+                    country: ($r.country? | default "")
+                    isp: ($r.isp? | default "")
+                }]
+            }
+        }
+        sleep 300ms   # stay under ip-api's batch rate limit
+    }
+    $rows
+}
+
+# Keep only rows attributed to a target country code.
+#   - IP hosts are geolocated via ip-api (no key)
+#   - domain hosts match by ccTLD (endswith .<cc>), plus common .com.<cc> style
+# Each kept row gains `cc` (and `geo_isp` for IP rows). host_field extracts the IOC string.
+def geo-filter [
+    rows: list<any>          # input records
+    cc: string               # ISO country code, e.g. TR
+    host_field: closure      # extracts the host/ip/url string from a row
+    --geo-cap: int = 500     # max unique IPs to geolocate
+] {
+    let target = ($cc | str trim | str uppercase)
+    if $target == "" { return $rows }
+    let cc_lower = ($target | str lowercase)
+
+    let is_ipv4 = { |v: string| (($v | parse --regex '^(?:\d{1,3}\.){3}\d{1,3}$' | length) > 0) }
+
+    let tagged = ($rows | each { |r|
+        let host = (ioc-host (do $host_field $r | into string))
+        { row: $r, host: $host, is_ip: (do $is_ipv4 $host) }
+    })
+
+    let ip_hosts = ($tagged | where is_ip | get host | uniq | first $geo_cap)
+    let geo = (if (($ip_hosts | length) > 0) { geo-batch $ip_hosts } else { [] })
+
+    let is_record = { |r| (($r | describe) | str starts-with "record") }
+
+    $tagged | each { |t|
+        if $t.is_ip {
+            let match = ($geo | where ip == $t.host)
+            if (($match | length) > 0) and (($match | get cc.0) == $target) {
+                if (do $is_record $t.row) { $t.row | merge { cc: $target, geo_isp: ($match | get isp.0) } } else { $t.row }
+            } else {
+                null
+            }
+        } else {
+            if (($t.host | str ends-with $".($cc_lower)")) {
+                if (do $is_record $t.row) { $t.row | merge { cc: $target } } else { $t.row }
+            } else {
+                null
+            }
+        }
+    } | where { |x| $x != null }
+}
+
+# Team Cymru Malware Hash Registry lookup via DNS (no key; md5/sha1 only)
+def cymru-mhr [hash: string] {
+    let h = ($hash | str trim | str lowercase)
+    let len = ($h | str length)
+    if ($len != 32 and $len != 40) {
+        return { supported: false, known: false, detection_pct: null, last_seen: "-" }
+    }
+    let has_dig = (try { (which dig | where type == "external" | length) > 0 } catch { false })
+    let raw = if $has_dig {
+        (try { ^dig +short TXT $"($h).malware.hash.cymru.com" | complete | get stdout } catch { "" })
+    } else {
+        (try { ^nslookup -type=TXT $"($h).malware.hash.cymru.com" | complete | get stdout } catch { "" })
+    }
+    let m = ($raw | str replace --all '"' '' | parse --regex '(?<epoch>\d{9,})\s+(?<pct>\d{1,3})')
+    if (($m | length) == 0) {
+        { supported: true, known: false, detection_pct: null, last_seen: "-" }
+    } else {
+        let epoch = (try { $m | get epoch.0 | into int } catch { 0 })
+        let pct = (try { $m | get pct.0 | into int } catch { 0 })
+        let seen = (try { ($epoch * 1_000_000_000) | into datetime | format date "%Y-%m-%d" } catch { "-" })
+        { supported: true, known: true, detection_pct: $pct, last_seen: $seen }
+    }
+}
+
+# Find an exact IOC in the cached ThreatFox full export (no key). Returns record or null.
+def threatfox-find [value: string, kind: string] {
+    let path = (threatfox-cache)
+    let v = ($value | str trim | str lowercase)
+    let hits = (open $path | values | flatten | where { |e|
+        let iv = ($e.ioc_value? | default "" | into string | str lowercase)
+        if $kind == "ip" {
+            ($iv == $v) or ($iv | str starts-with $"($v):")
+        } else if $kind == "domain" {
+            ($iv == $v) or ((ioc-host $iv) == $v)
+        } else if $kind == "url" {
+            $iv == $v
+        } else {
+            $iv == $v
+        }
+    })
+    let hit = ($hits | get 0?)
+    if ($hit == null) {
+        null
+    } else {
+        {
+            malware: ($hit.malware_printable? | default ($hit.malware? | default "-"))
+            threat_type: ($hit.threat_type? | default "-")
+            ioc_type: ($hit.ioc_type? | default "-")
+            first_seen: ($hit.first_seen_utc? | default "-")
+            reference: ($hit.reference? | default "-")
+        }
+    }
+}
+
+# Aggregate key-free IOC reputation from multiple sources.
+#   hash   -> ThreatFox export + Team Cymru MHR (AV %) + CIRCL hashlookup
+#   ip     -> ThreatFox export + ISC SANS DShield + ip-api (geo/hosting/proxy)
+#   domain -> ThreatFox export + urlscan.io
+#   url    -> ThreatFox export + urlscan.io
+def vt [ioc: string, --type: string] {
+    let value = ($ioc | str trim)
+    if $value == "" { error make { msg: "ioc cannot be empty." } }
+    let kind = if $type != null { ($type | str lowercase) } else { (ioc-type $value) }
+
+    if ($kind in ["hash" "file"]) {
+        let len = ($value | str length)
+        let algo = if $len == 32 { "md5" } else if $len == 40 { "sha1" } else if $len == 64 { "sha256" } else {
+            error make { msg: "hash must be md5(32), sha1(40) or sha256(64) hex chars." }
+        }
+        let tf = (threatfox-find $value "hash")
+        let cymru = (cymru-mhr $value)
+        let circl = (try { http get $"https://hashlookup.circl.lu/lookup/($algo)/($value)" } catch { null })
+        let circl_known = ($circl != null and (($circl.message? | default "") !~ "(?i)not found"))
+
+        let verdict = if ($tf != null or $cymru.known) {
+            "MALICIOUS"
+        } else if $circl_known {
+            "known / likely benign"
+        } else {
+            "unknown (no source has it)"
+        }
+
+        {
+            ioc: $value
+            type: $algo
+            verdict: $verdict
+            threatfox: (if $tf != null { $tf.malware } else { "-" })
+            threat_type: (if $tf != null { $tf.threat_type } else { "-" })
+            cymru_av: (if $cymru.known { $"($cymru.detection_pct)% \(seen ($cymru.last_seen)\)" } else { "-" })
+            circl_name: (if $circl_known { ($circl.FileName? | default "-") } else { "-" })
+            first_seen: (if $tf != null { $tf.first_seen } else { "-" })
+        }
+    } else if $kind == "ip" {
+        let tf = (threatfox-find $value "ip")
+        let ds = (abuse $value)
+        let geo = (try { ipinfo $value } catch { null })
+        let reports = (try { $ds.reports | into int } catch { 0 })
+
+        let verdict = if $tf != null {
+            "MALICIOUS"
+        } else if ($reports > 0) {
+            "suspicious (DShield reports)"
+        } else {
+            "no known reports"
+        }
+
+        {
+            ioc: $value
+            type: "ip"
+            verdict: $verdict
+            threatfox: (if $tf != null { $tf.malware } else { "-" })
+            threat_type: (if $tf != null { $tf.threat_type } else { "-" })
+            dshield_reports: $reports
+            country: ($ds.country? | default "-")
+            asname: ($ds.asname? | default "-")
+            isp: (if $geo != null { ($geo.isp? | default "-") } else { "-" })
+            hosting: (if $geo != null { ($geo.hosting? | default "-") } else { "-" })
+            proxy: (if $geo != null { ($geo.proxy? | default "-") } else { "-" })
+            first_seen: (if $tf != null { $tf.first_seen } else { "-" })
+        }
+    } else if ($kind in ["domain" "url"]) {
+        let tf = (threatfox-find $value $kind)
+        let query = if $kind == "domain" { $"domain:($value)" } else { $"page.url:\"($value)\"" }
+        let resp = (try {
+            http get $"https://urlscan.io/api/v1/search/?q=($query)&size=100"
+        } catch {
+            null
+        })
+        let results = (if $resp != null { ($resp.results? | default []) } else { [] })
+        let malicious = ($results | where { |r| ($r.verdicts?.overall?.malicious? | default false) } | length)
+        let tags = ($results | each { |r| $r.task?.tags? | default [] } | flatten | uniq | first 10)
+
+        let verdict = if $tf != null {
+            "MALICIOUS"
+        } else if ($malicious > 0) {
+            "suspicious (urlscan verdict)"
+        } else {
+            "no known reports"
+        }
+
+        {
+            ioc: $value
+            type: $kind
+            verdict: $verdict
+            threatfox: (if $tf != null { $tf.malware } else { "-" })
+            threat_type: (if $tf != null { $tf.threat_type } else { "-" })
+            urlscan_scans: ($results | length)
+            urlscan_malicious: $malicious
+            tags: $tags
+            last_scan: (try { $results | get 0.task.time } catch { "-" })
+        }
+    } else {
+        error make { msg: $"Unsupported --type: ($kind). Use ip|domain|hash|url." }
+    }
+}
+
+# IP reputation via ISC SANS DShield (no API key required)
+def abuse [ip: string] {
+    let target = ($ip | str trim)
+    if (($target | parse --regex '^(?:\d{1,3}\.){3}\d{1,3}$' | length) == 0) {
+        error make { msg: "abuse expects an IPv4 address." }
+    }
+
+    let resp = (try {
+        http get $"https://isc.sans.edu/api/ip/($target)?json"
+    } catch { |err|
+        error make { msg: $"DShield request failed: ($err.msg)" }
+    })
+
+    let d = ($resp.ip? | default {})
+    let attacks = ($d.attacks? | default null)
+    let reports = ($d.count? | default null)
+    {
+        ip: ($d.number? | default $target)
+        reports: (if $reports == null { 0 } else { $reports })
+        targets_attacked: (if $attacks == null { 0 } else { $attacks })
+        max_risk: ($d.maxrisk? | default "-")
+        as: ($d.as? | default "-")
+        asname: ($d.asname? | default "-")
+        country: ($d.ascountry? | default "-")
+        network: ($d.network? | default "-")
+        first_seen: ($d.mindate? | default "-")
+        last_seen: ($d.maxdate? | default "-")
+        abuse_contact: ($d.asabusecontact? | default "-")
+    }
+}
+
+# Download + cache the full ThreatFox export (no API key). Returns the JSON path.
+def threatfox-cache [--refresh, --ttl-hours: int = 6] {
+    let has_external_cmd = { |command: string|
+        (try {
+            let command_paths = (which --all $command | where type == "external" | get path)
+            (($command_paths | where { |candidate| ($candidate | str trim) != "" and ($candidate | path exists) } | length) > 0)
+        } catch {
+            false
+        })
+    }
+
+    let cache_dir = ([$env.HOME ".nusecurity" "cache"] | path join)
+    mkdir $cache_dir
+    let json_path = ([$cache_dir "threatfox_full.json"] | path join)
+    let zip_path = ([$cache_dir "threatfox_full.zip"] | path join)
+
+    let is_fresh = (if ($json_path | path exists) {
+        let age = ((date now) - (ls $json_path | get 0.modified))
+        $age < ($ttl_hours * 1hr)
+    } else {
+        false
+    })
+
+    if ($refresh or (not $is_fresh)) {
+        print $"(ansi cyan_bold)[otx](ansi reset) Refreshing ThreatFox full export \(cached ($ttl_hours)h\) ..."
+        try {
+            http get "https://threatfox.abuse.ch/export/json/full/" | save --force --raw $zip_path
+        } catch { |err|
+            error make { msg: $"ThreatFox full export download failed: ($err.msg)" }
+        }
+
+        let extracted = ([$cache_dir "full.json"] | path join)
+        if ($extracted | path exists) { rm -f $extracted }
+
+        if (do $has_external_cmd "unzip") {
+            ^unzip -o -q -d $cache_dir $zip_path
+        } else {
+            # Cross-platform fallback via Python's stdlib zipfile
+            run-external (py-bin) "-m" "zipfile" "-e" $zip_path $cache_dir
+        }
+
+        if (($extracted | path exists) == false) {
+            error make { msg: "ThreatFox export extracted but full.json not found." }
+        }
+        mv -f $extracted $json_path
+        rm -f $zip_path
+    }
+
+    $json_path
+}
+
+# Indicator/malware lookup against the ThreatFox export (no API key required).
+# Default searches the full export (cached 6h); --recent uses the small live feed.
+def otx [
+    ioc?: string       # IP/domain/URL/hash substring OR malware family name
+    --recent           # Search only the recent rolling feed (faster, less coverage)
+    --refresh          # Force refresh of the cached full export
+    --cc: string       # Keep only IOCs in this country (e.g. TR); geolocates IPs + ccTLD domains
+    --limit: int = 50  # Max rows returned
+] {
+    # `otx --refresh` with no IOC just refreshes the cached export and exits.
+    if ($ioc == null or (($ioc | str trim) == "")) {
+        if $refresh {
+            let path = (threatfox-cache --refresh)
+            let count = (open $path | values | flatten | length)
+            print $"(ansi green_bold)[otx](ansi reset) ThreatFox full export refreshed: ($count) IOCs cached."
+            return
+        }
+        error make { msg: "Provide an IOC/family to search, or use `otx --refresh` to just refresh the cache." }
+    }
+
+    let raw_needle = ($ioc | str trim | str lowercase)
+    let norm_needle = ($raw_needle | str replace --all --regex '[ ._-]' '')
+
+    let entries = if $recent {
+        let feed = (try {
+            http get "https://threatfox.abuse.ch/export/json/recent/"
+        } catch { |err|
+            error make { msg: $"ThreatFox feed request failed: ($err.msg)" }
+        })
+        $feed | values | flatten
+    } else {
+        let path = (if $refresh { threatfox-cache --refresh } else { threatfox-cache })
+        open $path | values | flatten
+    }
+
+    let matches = ($entries
+        | where { |entry|
+            let iocv = ($entry.ioc_value? | default "" | into string | str lowercase)
+            let names = ([
+                ($entry.malware? | default "")
+                ($entry.malware_alias? | default "")
+                ($entry.malware_printable? | default "")
+                ($entry.threat_type? | default "")
+            ] | str join " " | into string | str lowercase | str replace --all --regex '[ ._-]' '')
+            ($iocv | str contains $raw_needle) or (($norm_needle != "") and ($names | str contains $norm_needle))
+        }
+        | each { |entry|
+            {
+                ioc: ($entry.ioc_value? | default "-")
+                ioc_type: ($entry.ioc_type? | default "-")
+                threat_type: ($entry.threat_type? | default "-")
+                malware: ($entry.malware_printable? | default ($entry.malware? | default "-"))
+                confidence: ($entry.confidence_level? | default "-")
+                first_seen: ($entry.first_seen_utc? | default "-")
+                last_seen: ($entry.last_seen_utc? | default "-")
+                reference: ($entry.reference? | default "-")
+            }
+        }
+        | uniq)
+
+    let filtered = if ($cc != null and (($cc | str trim) != "")) {
+        geo-filter $matches ($cc) { |row| $row.ioc }
+    } else {
+        $matches
+    }
+
+    let source = if $recent { "recent feed" } else { "full export" }
+    if (($filtered | length) == 0) {
+        let cc_note = if ($cc != null and (($cc | str trim) != "")) { $" in ($cc | str uppercase)" } else { "" }
+        print $"(ansi yellow_bold)[otx](ansi reset) No match in ThreatFox ($source)($cc_note) for: ($ioc)."
+    }
+    if $limit > 0 { $filtered | first $limit } else { $filtered }
+}
+
 # Start HTTPSERVER
 def hs [--path: string] {
+    let py = (py-bin)
     if $path != null {
         let abs_path = ($path | str trim)
-        python -m http.server -d $abs_path
+        run-external $py "-m" "http.server" "-d" $abs_path
     } else {
-        python -m http.server
+        run-external $py "-m" "http.server"
     }
 }
 
 # Output with syntax highlighting
 def catt [targetfile: string] {
-    python -m rich.syntax $targetfile
+    run-external (py-bin) "-m" "rich.syntax" $targetfile
 }
 
 # Get Ifaces
@@ -111,7 +549,7 @@ def drmi [target_id: string] {
 
 # Install desired package
 def aget [target_package: string] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     let has_cmd = { |command: string|
         (try {
             let command_paths = (which --all $command | get path)
@@ -134,7 +572,7 @@ def aget [target_package: string] {
 
 # Remove package
 def arem [target_package: string] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     let has_cmd = { |command: string|
         (try {
             let command_paths = (which --all $command | get path)
@@ -157,7 +595,7 @@ def arem [target_package: string] {
 
 # List connections and listening ports
 def netcon [] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     let has_external_cmd = { |command: string|
         (try {
             let command_paths = (which --all $command | where type == "external" | get path)
@@ -182,9 +620,14 @@ def netcon [] {
     }
 }
 
-# Fetch last 50 C2 panel from Viriback
-def vrb [] {
-    http get https://tracker.viriback.com/last50.php | to json | from json
+# Fetch last 50 C2 panels from Viriback (optionally filter by country)
+def vrb [--cc: string] {
+    let rows = (http get https://tracker.viriback.com/last50.php)
+    if ($cc != null and (($cc | str trim) != "")) {
+        geo-filter $rows ($cc) { |row| $row.IP? | default ($row.URL? | default "") }
+    } else {
+        $rows
+    }
 }
 
 # Fetch data from URLHAUS
@@ -196,6 +639,7 @@ def haus [
     --host-contains: string      # Case-insensitive host contains filter
     --host-ends-with: string     # Host suffix filter, e.g. .tr
     --https-only                 # Keep only https URLs
+    --cc: string                 # Keep only entries in this country (geolocates hosts), e.g. TR
     --raw                        # Return raw feed without cleanup/filtering
 ] {
     let url_host = { |url_value: string|
@@ -206,7 +650,7 @@ def haus [
         })
     }
 
-    let normalized_type = ($datatype | str trim | str downcase)
+    let normalized_type = ($datatype | str trim | str lowercase)
     let source_type = if ($normalized_type in ["normal", "full"]) {
         "normal"
     } else if ($normalized_type in ["online", "active"]) {
@@ -240,24 +684,28 @@ def haus [
         }
 
         if ($contains != null) {
-            let needle = ($contains | str downcase)
-            $urls = ($urls | where { |u| ($u | str downcase | str contains $needle) })
+            let needle = ($contains | str lowercase)
+            $urls = ($urls | where { |u| ($u | str lowercase | str contains $needle) })
         }
 
         if ($host_contains != null) {
-            let needle = ($host_contains | str downcase)
+            let needle = ($host_contains | str lowercase)
             $urls = ($urls | where { |u|
                 let host = (do $url_host $u)
-                $host != null and ($host | str downcase | str contains $needle)
+                $host != null and ($host | str lowercase | str contains $needle)
             })
         }
 
         if ($host_ends_with != null) {
-            let suffix = ($host_ends_with | str downcase)
+            let suffix = ($host_ends_with | str lowercase)
             $urls = ($urls | where { |u|
                 let host = (do $url_host $u)
-                $host != null and ($host | str downcase | str ends-with $suffix)
+                $host != null and ($host | str lowercase | str ends-with $suffix)
             })
+        }
+
+        if ($cc != null and (($cc | str trim) != "")) {
+            $urls = (geo-filter $urls ($cc) { |u| $u })
         }
 
         if $host_only {
@@ -269,27 +717,36 @@ def haus [
     }
 }
 
-# Fetch data from ThreatFox
-def tfox [--dtype: string] {
+# Fetch data from ThreatFox (optionally filter by country)
+def tfox [--dtype: string, --cc: string] {
     let buffer = http get https://threatfox.abuse.ch/export/json/urls/recent/ | values
+    let has_cc = ($cc != null and (($cc | str trim) != ""))
     mut data_array = []
     if $dtype == "all" {
         for data in ($buffer) {
             $data_array ++= [{
-                "ioc": $data.ioc_value.0, 
-                "threat_type": $data.threat_type.0, 
-                "malware": $data.malware.0, 
-                "malware_printable": $data.malware_printable.0, 
-                "tags": $data.tags, 
+                "ioc": $data.ioc_value.0,
+                "threat_type": $data.threat_type.0,
+                "malware": $data.malware.0,
+                "malware_printable": $data.malware_printable.0,
+                "tags": $data.tags,
                 "reference": $data.reference
             }]
         }
-        $data_array | table
+        if $has_cc {
+            geo-filter $data_array ($cc) { |row| $row.ioc }
+        } else {
+            $data_array
+        }
     } else if $dtype == "url" {
         for data in ($buffer) {
             $data_array ++= [($data | get 0 | get ioc_value | to text)]
         }
-        $data_array
+        if $has_cc {
+            geo-filter $data_array ($cc) { |u| $u }
+        } else {
+            $data_array
+        }
     } else {
         "You must use: --dtype all/url"
     }
@@ -329,6 +786,10 @@ def pdsc [tool_name: string] {
 def hlp [command?: string, --verbose (-v)] {
     let summaries = {
         chkbgp: "Fetch ASN/BGP details for an IP."
+        ipinfo: "Geolocate/enrich an IP or host (ip-api)."
+        vt: "Aggregated key-free IOC reputation (ThreatFox+Cymru+urlscan)."
+        abuse: "IP reputation via ISC SANS DShield (no key)."
+        otx: "IOC/family lookup in ThreatFox full export (no key)."
         hs: "Start a quick HTTP file server."
         catt: "Show a file with syntax highlighting."
         ifc: "List network interfaces."
@@ -347,7 +808,10 @@ def hlp [command?: string, --verbose (-v)] {
         pdsc: "Install a ProjectDiscovery tool with Go."
         hlp: "Show commands and usage examples."
         shx: "Run subfinder + httpx domain scan."
-        bdc: "Decode Base64 text."
+        bdc: "Decode/encode Base64 text."
+        defang: "Defang IOCs for safe sharing."
+        refang: "Refang defanged IOCs."
+        hashf: "Compute md5/sha1/sha256 of a file."
         hdns: "Hunt candidate C2 domains with hednsextractor."
         "windows-evt-hunt": "Hunt Windows Event Log entries quickly."
         "persist-hunt": "Hunt persistence artifacts on host."
@@ -374,6 +838,10 @@ def hlp [command?: string, --verbose (-v)] {
 
     let samples = {
         chkbgp: "chkbgp 8.8.8.8"
+        ipinfo: "ipinfo 8.8.8.8"
+        vt: "vt 44d88612fea8a8f36de82e1278abb02f"
+        abuse: "abuse 45.83.12.9"
+        otx: "otx agenttesla"
         hs: "hs --path /tmp/share"
         catt: "catt configs/config.nu"
         ifc: "ifc"
@@ -385,7 +853,7 @@ def hlp [command?: string, --verbose (-v)] {
         aget: "aget nmap"
         arem: "arem nmap"
         netcon: "netcon"
-        vrb: "vrb"
+        vrb: "vrb --cc TR"
         haus: "haus normal --limit 20"
         tfox: "tfox --dtype url"
         hx: "hx subdomains.txt"
@@ -393,6 +861,9 @@ def hlp [command?: string, --verbose (-v)] {
         hlp: "hlp -v"
         shx: "shx example.com"
         bdc: "bdc SGVsbG8="
+        defang: "defang https://evil.example.com/path"
+        refang: "refang hxxps://evil[.]example[.]com/path"
+        hashf: "hashf suspicious.bin"
         hdns: "hdns suspicious-domain.com"
         "windows-evt-hunt": "windows-evt-hunt --log Security --event-id 4625 --since-hours 24"
         "persist-hunt": "persist-hunt --contains cron --limit 50"
@@ -418,30 +889,148 @@ def hlp [command?: string, --verbose (-v)] {
     }
 
     let examples = {
+        chkbgp: [
+            "chkbgp 8.8.8.8            # ASN / prefix / RIR details for an IP"
+        ]
+        ipinfo: [
+            "ipinfo 8.8.8.8           # geo + ISP/ASN + reverse DNS"
+            "ipinfo example.com       # resolve + enrich a hostname"
+        ]
+        vt: [
+            "vt aadfc11ee472ecd3e8dae7acde9233dac75acfa7   # hash -> ThreatFox + Cymru MHR"
+            "vt 160.20.109.75                     # ip -> ThreatFox + DShield + geo"
+            "vt evil.example.com                  # domain -> ThreatFox + urlscan.io"
+            "vt https://evil.example.com/x --type url   # force type when auto-detect is wrong"
+        ]
+        abuse: [
+            "abuse 45.83.12.9         # IP reputation via ISC SANS DShield"
+        ]
+        otx: [
+            "otx agenttesla           # by malware family name (full export)"
+            "otx 45.83.12.9           # by IP/domain/url substring"
+            "otx cobaltstrike --cc TR # only Turkey-based C2s"
+            "otx remcos --recent      # fast, recent feed only"
+            "otx --refresh            # just refresh the cached full export"
+        ]
+        hs: [
+            "hs                       # serve current dir on :8000"
+            "hs --path /tmp/share     # serve a specific folder"
+        ]
+        catt: [
+            "catt configs/config.nu   # print a file with syntax highlighting"
+        ]
+        ifc: [ "ifc                      # list network interfaces + addresses" ]
+        sd: [ "sd                       # list disks (size, model, mount)" ]
+        lsv: [ "lsv                      # ls sorted by size (biggest last)" ]
+        lsl: [ "lsl                      # ls sorted by modified time + mime" ]
+        dosh: [ "dosh ubuntu:24.04        # drop into bash inside an image" ]
+        drmi: [ "drmi 3a1b2c4d5e6f        # force-remove an image by id" ]
+        aget: [ "aget nmap                # install a package (apt / winget)" ]
+        arem: [ "arem nmap                # remove a package (apt / winget)" ]
+        netcon: [ "netcon                   # IPv4 connections + listening ports" ]
+        vrb: [
+            "vrb                      # latest 50 C2 panels (Viriback)"
+            "vrb --cc TR              # only Turkey-based C2 panels"
+        ]
         haus: [
-            "haus normal --limit 20"
-            "haus --host-only --contains \"in.net\" --limit 10"
-            "haus --host-ends-with \".tr\" --host-only --limit 20"
+            "haus normal --limit 20              # newest 20 malware URLs"
+            "haus --host-only --contains in.net --limit 10   # unique hosts matching a string"
+            "haus --host-ends-with .tr --host-only --limit 20 # only .tr hosts"
+            "haus online --cc TR --host-only     # only IOCs geolocated to Turkey"
         ]
         tfox: [
-            "tfox --dtype url"
-            "tfox --dtype all"
+            "tfox --dtype url         # recent IOC URLs only"
+            "tfox --dtype all         # full records (malware, tags, refs)"
+            "tfox --dtype all --cc TR # only Turkey-based IOCs"
         ]
-        triage: [
-            "triage --family agenttesla --limit 5"
-            "triage --family remcos --limit 3"
-            "triage --query \"sha1:...\" --limit 3 --no-c2 --no-config"
-            "triage --query \"sha256:...\" --limit 1 | get 0.MalwareConfig"
+        hx: [
+            "hx subdomains.txt        # httpx probe a list (status/title/tech)"
         ]
-        rware: [
-            "rware tr --limit 20"
-            "rware --limit 20"
-            "rware tr --monitor --interval 30 --max-cycles 20"
+        pdsc: [
+            "pdsc nuclei              # go install a ProjectDiscovery tool"
+            "pdsc subfinder"
+        ]
+        hlp: [
+            "hlp                      # list all project commands"
+            "hlp -v                   # verbose: usage + params for each"
+            "hlp otx                  # full detail + examples for one command"
+        ]
+        shx: [ "shx example.com          # subfinder | httpx (live subdomains)" ]
+        bdc: [
+            "bdc SGVsbG8=             # base64 decode"
+            "bdc -e 'Hello World'     # base64 encode"
+        ]
+        defang: [
+            "defang https://evil.example.com/x   # -> hxxps://evil[.]example[.]com/x"
+        ]
+        refang: [
+            "refang hxxps://evil[.]example[.]com # -> https://evil.example.com"
+        ]
+        hashf: [
+            "hashf suspicious.bin     # md5 + sha1 + sha256 + size of a file"
+        ]
+        hdns: [
+            "hdns suspicious-domain.com  # pivot to related C2 domains (hedns)"
+        ]
+        "windows-evt-hunt": [
+            "windows-evt-hunt --log Security --event-id 4625 --since-hours 24   # failed logons"
+            "windows-evt-hunt --log System --contains error --since-hours 12"
+        ]
+        "persist-hunt": [
+            "persist-hunt                    # dump autostart/persistence points"
+            "persist-hunt --contains cron --limit 50   # filter by keyword"
+        ]
+        "proc-hunt": [
+            "proc-hunt                       # score all processes"
+            "proc-hunt --min-score 2 --limit 50   # only suspicious ones"
+            "proc-hunt --contains powershell"
         ]
         "proc-dump": [
-            "proc-dump lsass --out-dir C:\\dumps"
-            "proc-dump ollama.exe --out-dir C:\\dumps --mini"
-            "proc-dump notepad.exe --out-dir C:\\dumps --full"
+            "proc-dump lsass --out-dir C:\\dumps          # full memory dump (Windows)"
+            "proc-dump notepad.exe --out-dir C:\\dumps --mini"
+            "proc-dump 4242 --out-dir C:\\dumps --full    # by PID"
+        ]
+        "log-hunt": [
+            "log-hunt                        # scan auth/syslog for common IOCs"
+            "log-hunt \"failed password\" --since-hours 24 --limit 100"
+        ]
+        "timeline-lite": [
+            "timeline-lite /var/tmp                     # files by mtime"
+            "timeline-lite /var/tmp --with-hash --limit 100   # add sha256"
+        ]
+        upc: [ "upc                      # pull latest config.nu from GitHub" ]
+        clean: [ "clean                    # apt autoremove/autoclean + cache purge" ]
+        arpt: [ "arpt                     # ARP/neighbor table (IP + MAC + iface)" ]
+        ff: [
+            "ff sshd_config           # find a file by name, system-wide"
+            "ff .env"
+        ]
+        serv: [ "serv                     # active/inactive status of services" ]
+        dls: [ "dls                      # list block devices/partitions (lsblk)" ]
+        fixu: [
+            "fixu /dev/sdb1           # WIPE + format a USB as FAT32 (careful!)"
+        ]
+        yrs: [
+            "yrs suspicious.bin       # YARA-scan a file (auto-fetches rules)"
+        ]
+        rware: [
+            "rware                    # global recent ransomware victims"
+            "rware tr --limit 20      # victims in a country"
+            "rware tr --monitor --interval 30 --max-cycles 20   # live watch"
+        ]
+        pls: [
+            "pls                      # proxy list with geo/ISP"
+            "pls --cc TR              # only Turkish proxies"
+        ]
+        crt: [ "crt example.com          # subdomains from crt.sh (fast, no httpx)" ]
+        rip: [ "rip 1.1.1.1              # reverse-IP: other domains on that host" ]
+        dchr: [ "dchr example.com         # historical A records for a domain" ]
+        gf: [ "gf https://example.com/open/   # list file names in an open dir" ]
+        triage: [
+            "triage --family remcos --limit 3          # recent reports for a family"
+            "triage --family agenttesla --limit 5"
+            "triage --query \"sha256:...\" --limit 1 | get 0.MalwareConfig   # pull config"
+            "triage --query \"sha1:...\" --limit 3 --no-c2 --no-config"
         ]
     }
 
@@ -540,9 +1129,65 @@ def shx [target_domain: string] {
     subfinder -silent -d $target_domain | httpx -silent -mc 200 -sc -title -td
 }
 
-# Base64 decoder
-def bdc [pattern: string] {
-    echo $pattern | base64 -d
+# Base64 decode/encode (native, cross-platform)
+def bdc [pattern: string, --encode (-e)] {
+    if $encode {
+        $pattern | encode base64
+    } else {
+        $pattern | decode base64 | decode
+    }
+}
+
+# Defang IOCs so URLs/IPs/domains are safe to paste in reports/chats
+def defang [ioc: string] {
+    $ioc
+    | str replace --all "https://" "hxxps://"
+    | str replace --all "http://" "hxxp://"
+    | str replace --all "." "[.]"
+    | str replace --all "@" "[@]"
+}
+
+# Refang defanged IOCs back into their original form
+def refang [ioc: string] {
+    $ioc
+    | str replace --all "[.]" "."
+    | str replace --all "(.)" "."
+    | str replace --all "[@]" "@"
+    | str replace --all "[:]" ":"
+    | str replace --all "hxxps://" "https://"
+    | str replace --all "hxxp://" "http://"
+    | str replace --all "hxxps" "https"
+    | str replace --all "hxxp" "http"
+}
+
+# Compute file hashes (md5/sha256 native, sha1 via sha1sum when present)
+def hashf [target_file: string] {
+    if (($target_file | path exists) == false) {
+        error make { msg: $"File not found: ($target_file)" }
+    }
+    if ((try { $target_file | path type } catch { "other" }) != "file") {
+        error make { msg: $"Not a file: ($target_file)" }
+    }
+
+    let bytes = (open --raw $target_file)
+    let sha1 = (try {
+        let out = (^sha1sum $target_file | complete)
+        if $out.exit_code == 0 {
+            $out.stdout | str trim | split row " " | first
+        } else {
+            "-"
+        }
+    } catch {
+        "-"
+    })
+
+    {
+        file: $target_file
+        size: (ls $target_file | get 0.size)
+        md5: ($bytes | hash md5)
+        sha1: $sha1
+        sha256: ($bytes | hash sha256)
+    }
 }
 
 # Normalize parsed JSON output to a list of records
@@ -622,7 +1267,7 @@ def windows-evt-hunt [
     --since-hours: int = 24     # Search window in hours
     --limit: int = 200          # Max returned rows
 ] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     if ($is_windows == false) {
         error make { msg: "windows-evt-hunt can only run on Windows." }
     }
@@ -668,8 +1313,8 @@ def persist-hunt [
     --contains: string  # Optional case-insensitive keyword filter
     --limit: int = 300  # Max returned rows
 ] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
-    let keyword = if $contains != null { ($contains | str downcase | str trim) } else { null }
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
+    let keyword = if $contains != null { ($contains | str lowercase | str trim) } else { null }
 
     if $is_windows {
         let safe_keyword = if $keyword != null {
@@ -739,7 +1384,7 @@ def persist-hunt [
                 }
 
                 let path_text = ($path_item | into string)
-                let lc_path = ($path_text | str downcase)
+                let lc_path = ($path_text | str lowercase)
                 let category = if ($lc_path | str contains "/cron") {
                     "cron"
                 } else if ($lc_path | str contains "systemd") {
@@ -767,7 +1412,7 @@ def persist-hunt [
                 let matches_keyword = if $keyword == null {
                     true
                 } else {
-                    (($path_text | str downcase | str contains $keyword) or ($clue | str downcase | str contains $keyword))
+                    (($path_text | str lowercase | str contains $keyword) or ($clue | str lowercase | str contains $keyword))
                 }
 
                 if $matches_keyword {
@@ -796,8 +1441,8 @@ def proc-hunt [
     --min-score: int = 1 # Minimum heuristic score to keep
     --limit: int = 200   # Max returned rows
 ] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
-    let needle = if $contains != null { ($contains | str downcase | str trim) } else { null }
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
+    let needle = if $contains != null { ($contains | str lowercase | str trim) } else { null }
 
     let process_rows = if $is_windows {
         let raw = (powershell-text "Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name, CommandLine | ConvertTo-Json -Depth 4")
@@ -830,7 +1475,7 @@ def proc-hunt [
     }
 
     let scored = ($process_rows | each { |proc|
-        let cmd = ($proc.cmdline | str downcase)
+        let cmd = ($proc.cmdline | str lowercase)
         mut score = 0
         mut reasons = []
 
@@ -854,7 +1499,7 @@ def proc-hunt [
             $score = ($score + 3)
             $reasons ++= ["shell-tunneling"]
         }
-        if (($proc.name | str downcase) =~ '(python|bash|sh|powershell|cmd|wscript|cscript)') and ($cmd =~ '(http://|https://)') {
+        if (($proc.name | str lowercase) =~ '(python|bash|sh|powershell|cmd|wscript|cscript)') and ($cmd =~ '(http://|https://)') {
             $score = ($score + 1)
             $reasons ++= ["script-with-url"]
         }
@@ -862,7 +1507,7 @@ def proc-hunt [
         let matches_needle = if $needle == null {
             true
         } else {
-            ((($proc.name | str downcase) | str contains $needle) or ($cmd | str contains $needle))
+            ((($proc.name | str lowercase) | str contains $needle) or ($cmd | str contains $needle))
         }
 
         if ($score >= $min_score and $matches_needle) {
@@ -893,7 +1538,7 @@ def proc-dump [
     --count (-n): int = 1      # Number of dumps to capture
     --name: string             # Optional dump filename (defaults to auto-generated)
 ] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     if ($is_windows == false) {
         error make { msg: "proc-dump can only run on Windows." }
     }
@@ -1012,9 +1657,9 @@ def log-hunt [
     --since-hours: int = 24 # Journal/Event lookback in hours
     --limit: int = 300      # Max returned rows
 ] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     let default_pattern = "failed password|authentication failure|invalid user|sudo:|powershell|cmd.exe|wget|curl|base64|rundll32|mshta|certutil"
-    let needle = if $pattern != null { ($pattern | str trim | str downcase) } else { null }
+    let needle = if $pattern != null { ($pattern | str trim | str lowercase) } else { null }
     let auth_failure_hint = if $needle == null {
         true
     } else {
@@ -1080,7 +1725,7 @@ def log-hunt [
                 | lines
                 | enumerate
                 | where { |row|
-                    let line = ($row.item | str downcase)
+                    let line = ($row.item | str lowercase)
                     if $needle != null {
                         $line | str contains $needle
                     } else {
@@ -1105,7 +1750,7 @@ def log-hunt [
                 journalctl --since $"($since_hours) hours ago" --no-pager
                 | lines
                 | where { |line|
-                    let lc = ($line | str downcase)
+                    let lc = ($line | str lowercase)
                     if $needle != null {
                         $lc | str contains $needle
                     } else {
@@ -1134,12 +1779,12 @@ def timeline-lite [
         error make { msg: $"Path not found: ($target_path)" }
     }
 
-    let needle = if $contains != null { ($contains | str downcase | str trim) } else { null }
+    let needle = if $contains != null { ($contains | str lowercase | str trim) } else { null }
     mut files = (glob $"($target_path)/**")
     $files = ($files | where { |entry| (try { ($entry | path type) == "file" } catch { false }) })
 
     if $needle != null {
-        $files = ($files | where { |entry| (($entry | into string | str downcase) | str contains $needle) })
+        $files = ($files | where { |entry| (($entry | into string | str lowercase) | str contains $needle) })
     }
 
     let rows = ($files | each { |entry|
@@ -1202,7 +1847,7 @@ def upc [] {
 
 #System Cleaner
 def clean [] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     let has_cmd = { |command: string|
         (try {
             let command_paths = (which --all $command | get path)
@@ -1212,7 +1857,7 @@ def clean [] {
         })
     }
 
-    let confirm = (input $"(ansi red_bold)System cache will be cleaned. Are you sure? [Y/n]: (ansi reset)" | str trim | str downcase)
+    let confirm = (input $"(ansi red_bold)System cache will be cleaned. Are you sure? [Y/n]: (ansi reset)" | str trim | str lowercase)
     if $confirm == "y" or $confirm == "" {
         if $is_windows {
             if (do $has_cmd "powershell") {
@@ -1231,14 +1876,37 @@ def clean [] {
     }
 }
 
-# Get ARP table with style!
+# Get ARP/neighbor table with style!
 def arpt [] {
-    arp -a | lines | split column " " | select column2 column4 column5 column7 | rename IP_Address MAC_Address Proto Interface
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
+    let has_external_cmd = { |command: string|
+        (try {
+            let command_paths = (which --all $command | where type == "external" | get path)
+            (($command_paths | where { |candidate| ($candidate | str trim) != "" and ($candidate | path exists) } | length) > 0)
+        } catch {
+            false
+        })
+    }
+
+    if $is_windows {
+        arp -a
+        | lines
+        | parse --regex '\s*(?<IP_Address>(?:[0-9]{1,3}\.){3}[0-9]{1,3})\s+(?<MAC_Address>[0-9a-fA-F-]{11,17})\s+(?<Type>\w+)'
+    } else if (do $has_external_cmd "ip") {
+        ip neigh
+        | lines
+        | parse --regex '^(?<IP_Address>\S+)\s+dev\s+(?<Interface>\S+)(?:\s+lladdr\s+(?<MAC_Address>\S+))?.*\s(?<State>\S+)\s*$'
+        | where { |row| ($row.MAC_Address? | default "") != "" }
+    } else if (do $has_external_cmd "arp") {
+        arp -a | lines | split column " " | select column2 column4 column5 column7 | rename IP_Address MAC_Address Proto Interface
+    } else {
+        error make { msg: "No ARP source found (need 'ip' or 'arp')." }
+    }
 }
 
 # Search for target file in the system
 def ff [target_file: string] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     let has_cmd = { |command: string|
         (try {
             let command_paths = (which --all $command | get path)
@@ -1281,7 +1949,7 @@ def ff [target_file: string] {
 
 # List active and inactive services
 def serv [] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     if $is_windows {
         powershell -NoProfile -Command 'Get-Service | Select-Object Name,Status | Sort-Object Name'
         return
@@ -1303,7 +1971,7 @@ def serv [] {
 
 # List disk partitions (lsblk with style!)
 def dls [] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     let has_external_cmd = { |command: string|
         (try {
             let command_paths = (which --all $command | where type == "external" | get path)
@@ -1317,7 +1985,7 @@ def dls [] {
         sys disks
     } else {
         if (do $has_external_cmd "lsblk") {
-            lsblk -r | lines | split column " " | skip 1 |select column1 column2 column3 column4 column5 column6 column7 | rename NAME MAJ:MIN RM SIZE RO TYPE MOUNTPOINTS
+            lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT | detect columns
         } else {
             sys disks
         }
@@ -1326,7 +1994,7 @@ def dls [] {
 
 # Format/fix USB or USB like devices
 def fixu [target_disk: string] {
-    let is_windows = (($nu.os-info.name | str downcase) == "windows")
+    let is_windows = (($nu.os-info.name | str lowercase) == "windows")
     if $is_windows {
         error make { msg: "fixu is disabled on Windows. Use Disk Management or diskpart carefully." }
     }
@@ -1424,7 +2092,7 @@ def rware [
 
     let fetch = { |selected_country_code?|
         if ($selected_country_code != null and (($selected_country_code | str trim) != "")) {
-            let code = ($selected_country_code | str trim | str upcase)
+            let code = ($selected_country_code | str trim | str uppercase)
             let data = (http get $"https://api.ransomware.live/v2/countryvictims/($code)" | to json | from json)
             $data | each { |d|
                 {
@@ -1502,8 +2170,8 @@ def rware [
     }
 }
 
-# Fetch latest proxy list
-def pls [] {
+# Fetch latest proxy list (optionally filter by country)
+def pls [--cc: string] {
     let pdata = (http get https://raw.githubusercontent.com/themiralay/Proxy-List-World/refs/heads/master/data-with-geolocation.json | to json | from json)
     mut p_array = []
     for d in ($pdata) {
@@ -1517,7 +2185,12 @@ def pls [] {
             "as": $d.geolocation.as
         }]
     }
-    $p_array
+    if ($cc != null and (($cc | str trim) != "")) {
+        let target = ($cc | str trim | str uppercase)
+        $p_array | where { |row| ($row.country_code | into string | str uppercase) == $target }
+    } else {
+        $p_array
+    }
 }
 
 # Enumerate subdomains using crt.sh (faster than shx command but no httpx!)
@@ -1605,7 +2278,7 @@ def triage [
     ]
 
     let benign_host = { |host: string|
-        let normalized = ($host | str downcase | str trim)
+        let normalized = ($host | str lowercase | str trim)
         (($known_benign | where { |item|
             ($normalized == $item) or ($normalized | str ends-with $".($item)")
         } | length) > 0)
@@ -1625,7 +2298,7 @@ def triage [
     }
 
     let suspicious_host = { |host: string|
-        let normalized = ($host | str downcase | str trim)
+        let normalized = ($host | str lowercase | str trim)
         if $normalized == "" {
             false
         } else if (do $benign_host $normalized) {
@@ -1718,7 +2391,7 @@ def triage [
         })
 
         let download_urls = ($raw_urls | where { |u|
-            ($u | str downcase) =~ '\.(bin|exe|dll|dat|ps1|vbs|scr|bat|cmd|zip|rar|7z|hta|msi|jar)(\?|$)'
+            ($u | str lowercase) =~ '\.(bin|exe|dll|dat|ps1|vbs|scr|bat|cmd|zip|rar|7z|hta|msi|jar)(\?|$)'
         })
 
         let download_hosts = ($download_urls | each { |u| do $url_host $u } | where { |h| $h != null and ($h | str trim) != "" })
@@ -1843,7 +2516,7 @@ def triage [
                 }
                 | flatten
                 | each { |entry| $entry | str trim }
-                | where { |entry| ($entry | str downcase | str starts-with "http") }
+                | where { |entry| ($entry | str lowercase | str starts-with "http") }
             } catch {
                 []
             })
@@ -1904,7 +2577,7 @@ def triage [
             $cred_block
             | parse --regex '(?s)<li class="nano"><b>(?:<br>)?([^<:]+):\s*</b>(.*?)</li>'
             | each { |row|
-                let k = (do $clean_html_text $row.capture0 | str downcase)
+                let k = (do $clean_html_text $row.capture0 | str lowercase)
                 let v = (do $clean_html_text $row.capture1)
                 if ($k != "" and $v != "") { $"($k)=($v)" } else { null }
             }
