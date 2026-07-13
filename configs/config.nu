@@ -247,6 +247,25 @@ def threatfox-find [value: string, kind: string] {
     }
 }
 
+# True for popular legit hosts that commonly appear in IOCs as abused infra
+def benign-host [host: string] {
+    let known = [
+        "google.com" "googleapis.com" "gstatic.com" "goo.gl"
+        "github.com" "githubusercontent.com" "githubassets.com" "github.io"
+        "microsoft.com" "windows.com" "office.com" "live.com" "msftconnecttest.com"
+        "cloudflare.com" "cloudflare.net" "cloudflareinsights.com"
+        "amazonaws.com" "amazon.com" "akamai.net" "akamaized.net" "fastly.net"
+        "discord.com" "discordapp.com" "discord.gg" "telegram.org" "t.me"
+        "pastebin.com" "bit.ly" "tinyurl.com" "ngrok.io" "ngrok-free.app"
+        "dropbox.com" "dropboxusercontent.com" "onedrive.live.com" "1drv.ms"
+        "wordpress.com" "blogspot.com" "wixsite.com" "weebly.com"
+        "sourceforge.net" "gitlab.com" "bitbucket.org" "gitee.com"
+        "gvt1.com" "digicert.com" "sectigo.com" "letsencrypt.org"
+    ]
+    let h = ($host | str lowercase | str trim)
+    ($known | any { |b| $h == $b or ($h | str ends-with $".($b)") })
+}
+
 # Aggregate key-free IOC reputation from multiple sources.
 #   hash   -> ThreatFox export + Team Cymru MHR (AV %) + CIRCL hashlookup
 #   ip     -> ThreatFox export + ISC SANS DShield + ip-api (geo/hosting/proxy)
@@ -325,7 +344,11 @@ def vt [ioc: string, --type: string] {
         let malicious = ($results | where { |r| ($r.verdicts?.overall?.malicious? | default false) } | length)
         let tags = ($results | each { |r| $r.task?.tags? | default [] } | flatten | uniq | first 10)
 
-        let verdict = if $tf != null {
+        let host_for_benign = if $kind == "domain" { $value } else { (ioc-host $value) }
+        let benign = (benign-host $host_for_benign)
+        let verdict = if ($tf != null and $benign) {
+            "likely benign (popular host; appears in IOCs as abused infra)"
+        } else if $tf != null {
             "MALICIOUS"
         } else if ($malicious > 0) {
             "suspicious (urlscan verdict)"
@@ -503,6 +526,141 @@ def otx [
         print $"(ansi yellow_bold)[otx](ansi reset) No match in ThreatFox ($source)($cc_note) for: ($ioc)."
     }
     if $limit > 0 { $filtered | first $limit } else { $filtered }
+}
+
+# DNS records for a domain via dig (A/AAAA/MX/NS/TXT/CNAME) — no key
+def dns-records [domain: string] {
+    mut out = {}
+    for t in ["A" "AAAA" "MX" "NS" "TXT" "CNAME"] {
+        let vals = (try {
+            ^dig +short $t $domain
+            | complete
+            | get stdout
+            | lines
+            | each { |l| $l | str trim }
+            | where { |l| $l != "" }
+        } catch {
+            []
+        })
+        $out = ($out | insert $t $vals)
+    }
+    $out
+}
+
+# Reverse-IP: other domains sharing an IP, via HackerTarget (no key)
+def reverse-ip [ip: string, --limit: int = 50] {
+    let body = (try { http get $"https://api.hackertarget.com/reverseiplookup/?q=($ip)" | into string } catch { "" })
+    let lc = ($body | str lowercase)
+    if ($body == "" or ($lc | str contains "error") or ($lc | str contains "api count")) {
+        []
+    } else {
+        let rows = ($body | lines | each { |l| $l | str trim } | where { |l| $l != "" })
+        if $limit > 0 { $rows | first $limit } else { $rows }
+    }
+}
+
+# Registration info via RDAP (no key) for a domain or IP
+def rdap-info [target: string] {
+    let is_ip_target = ((($target | into string) | parse --regex '^(?:\d{1,3}\.){3}\d{1,3}$' | length) > 0)
+    let url = if $is_ip_target { $"https://rdap.org/ip/($target)" } else { $"https://rdap.org/domain/($target)" }
+    let d = (try { http get --redirect-mode follow $url | from json } catch { null })
+    if $d == null { return {} }
+
+    let ev = ($d.events? | default [])
+    let ev_date = { |action| ($ev | where eventAction == $action | get eventDate.0? | default "-") }
+
+    if $is_ip_target {
+        {
+            handle: ($d.handle? | default "-")
+            name: ($d.name? | default "-")
+            country: ($d.country? | default "-")
+            type: ($d.type? | default "-")
+            registration: (do $ev_date "registration")
+            last_changed: (do $ev_date "last changed")
+        }
+    } else {
+        let reg = ($d.entities? | default [] | where { |e| "registrar" in ($e.roles? | default []) } | get 0?)
+        let registrar = (if $reg != null {
+            (try {
+                $reg.vcardArray.1 | where { |x| ($x | get 0?) == "fn" } | get 0.3?
+            } catch { "-" } | default "-")
+        } else { "-" })
+        {
+            handle: ($d.handle? | default "-")
+            domain: ($d.ldhName? | default $target)
+            registrar: $registrar
+            status: ($d.status? | default [])
+            registration: (do $ev_date "registration")
+            expiration: (do $ev_date "expiration")
+            last_changed: (do $ev_date "last changed")
+        }
+    }
+}
+
+# One-shot IOC report: everything we know about a URL/domain/IP/hash from
+# key-free sources. Prints sectioned tables; use --json for a structured record.
+def iocall [
+    ioc: string        # URL, domain, IP, or file hash
+    --json             # Return the aggregated record instead of printing
+    --limit: int = 25  # Cap for list sections (related domains, subdomains, ...)
+] {
+    let raw = ($ioc | str trim)
+    if $raw == "" { error make { msg: "ioc cannot be empty." } }
+    let kind = (ioc-type $raw)
+
+    mut results = {}
+
+    if ($kind == "hash") {
+        $results = { reputation: (try { vt $raw } catch { {} }) }
+    } else if ($kind == "ip") {
+        let rdns = (try { ^dig +short -x $raw | complete | get stdout | lines | first | default "-" } catch { "-" })
+        $results = {
+            reputation: (try { vt $raw } catch { {} })
+            geo: (try { ipinfo $raw } catch { {} })
+            bgp: (try { chkbgp $raw } catch { {} })
+            rdap: (try { rdap-info $raw } catch { {} })
+            reverse_dns: $rdns
+            related_domains: (try { reverse-ip $raw --limit $limit } catch { [] })
+            threatfox_hits: (try { otx $raw --limit $limit } catch { [] })
+        }
+    } else if ($kind == "domain") {
+        let ips = (try { ^dig +short A $raw | complete | get stdout | lines | each { |l| $l | str trim } | where { |l| $l =~ '^(?:\d{1,3}\.){3}\d{1,3}$' } } catch { [] })
+        let primary = ($ips | get 0?)
+        $results = {
+            resolved_ips: $ips
+            reputation: (try { vt $raw } catch { {} })
+            dns: (try { dns-records $raw } catch { {} })
+            rdap: (try { rdap-info $raw } catch { {} })
+            subdomains: (try { crt $raw | first $limit } catch { [] })
+            ip_geo: (if $primary != null { (try { ipinfo $primary } catch { {} }) } else { {} })
+            ip_reputation: (if $primary != null { (try { abuse $primary } catch { {} }) } else { {} })
+        }
+    } else {
+        # url
+        let host = (ioc-host $raw)
+        let ips = (try { ^dig +short A $host | complete | get stdout | lines | each { |l| $l | str trim } | where { |l| $l =~ '^(?:\d{1,3}\.){3}\d{1,3}$' } } catch { [] })
+        let primary = ($ips | get 0?)
+        $results = {
+            host: $host
+            defanged: (try { defang $raw } catch { $raw })
+            reputation: (try { vt $raw --type url } catch { {} })
+            host_reputation: (try { vt $host } catch { {} })
+            resolved_ips: $ips
+            dns: (try { dns-records $host } catch { {} })
+            rdap: (try { rdap-info $host } catch { {} })
+            ip_geo: (if $primary != null { (try { ipinfo $primary } catch { {} }) } else { {} })
+        }
+    }
+
+    if $json {
+        return ({ ioc: $raw, type: $kind } | merge $results)
+    }
+
+    print $"(ansi cyan_bold)IOC:(ansi reset) ($raw)   (ansi cyan_bold)type:(ansi reset) ($kind)"
+    $results | items { |section, value|
+        print $"\n(ansi green_bold)== ($section) ==(ansi reset)"
+        print ($value | table -e)
+    } | ignore
 }
 
 # Start HTTPSERVER
@@ -788,6 +946,7 @@ def hlp [command?: string, --verbose (-v)] {
         chkbgp: "Fetch ASN/BGP details for an IP."
         ipinfo: "Geolocate/enrich an IP or host (ip-api)."
         vt: "Aggregated key-free IOC reputation (ThreatFox+Cymru+urlscan)."
+        iocall: "Full one-shot report for any IOC (url/domain/ip/hash)."
         abuse: "IP reputation via ISC SANS DShield (no key)."
         otx: "IOC/family lookup in ThreatFox full export (no key)."
         hs: "Start a quick HTTP file server."
@@ -840,6 +999,7 @@ def hlp [command?: string, --verbose (-v)] {
         chkbgp: "chkbgp 8.8.8.8"
         ipinfo: "ipinfo 8.8.8.8"
         vt: "vt 44d88612fea8a8f36de82e1278abb02f"
+        iocall: "iocall evil.example.com"
         abuse: "abuse 45.83.12.9"
         otx: "otx agenttesla"
         hs: "hs --path /tmp/share"
@@ -901,6 +1061,13 @@ def hlp [command?: string, --verbose (-v)] {
             "vt 160.20.109.75                     # ip -> ThreatFox + DShield + geo"
             "vt evil.example.com                  # domain -> ThreatFox + urlscan.io"
             "vt https://evil.example.com/x --type url   # force type when auto-detect is wrong"
+        ]
+        iocall: [
+            "iocall evil.example.com          # full report: rep + dns + rdap + subdomains + IP geo"
+            "iocall 160.20.109.75             # rep + geo + bgp + rdns + reverse-IP domains + C2 hits"
+            "iocall https://bad.site/payload  # url: rep + host dns/geo/rdap + defanged"
+            "iocall <sha256>                  # hash reputation aggregate"
+            "iocall evil.example.com --json   # structured record (pipe/export)"
         ]
         abuse: [
             "abuse 45.83.12.9         # IP reputation via ISC SANS DShield"
