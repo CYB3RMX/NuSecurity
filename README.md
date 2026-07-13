@@ -4,16 +4,24 @@ Nushell config and helper commands for security research workflows.
 ## Available Commands
 ![commands](https://github.com/user-attachments/assets/2f467c46-e7c5-441d-91b4-2be33fd101bd)
 
+Run `hlp` for the current command list, or `hlp <command>` for detailed usage and annotated examples (the image above may lag behind new commands).
+
 ## Requirements
-- `nu` (Nushell)
-- Common CLI tools (`python`, `git`, `curl`/network access)
+- `nu` (Nushell) — targets 0.114+ (`str lowercase`/`str uppercase`)
+- Common CLI tools (`python3`, `git`, `curl`/network access)
 - Optional: `go` for auto-installing some tools (`httpx`, `hednsextractor`)
 - Optional: `yara` for local rule scanning with `yrs`
+- Optional: `dig` (or `nslookup`) for `vt` hash lookups via Team Cymru MHR
+- Optional: `unzip` (or `python3`) for the `otx` full ThreatFox export
 - Optional on Linux: `apt` + `sudo` for package helper commands
 - Optional on Linux: `journalctl` for richer `log-hunt` output
 - Optional on Windows: `winget` for package helper commands
 - Optional on Windows: `powershell` for `windows-evt-hunt` / `log-hunt` / `persist-hunt`
 - Optional on Windows: `procdump` (Sysinternals) for `proc-dump`
+
+No API keys are required for the built-in threat-intel commands (`vt`, `abuse`,
+`otx`). Only `rip` / `dchr` need a WHOISXMLAPI key, prompted once and saved to
+`~/.whoisxmlkey.txt`.
 
 ## Setup
 Run this in Nushell (Linux/macOS/Windows):
@@ -34,12 +42,43 @@ Enable it with:
 $env.NUSECURITY_SHOW_SYSINFO = true
 ```
 
+## Threat Intelligence (no API key)
+```nu
+vt aadfc11ee472ecd3e8dae7acde9233dac75acfa7  # hash reputation (ThreatFox + Cymru MHR + CIRCL)
+vt 160.20.109.75            # IP reputation (ThreatFox + DShield + ip-api geo/hosting)
+vt evil.example.com         # domain reputation (ThreatFox + urlscan.io)
+abuse 45.83.12.9            # IP reputation via ISC SANS DShield
+ipinfo 8.8.8.8             # geo + ISP/ASN + reverse DNS enrichment
+otx agenttesla             # search ThreatFox full export by malware family
+otx 45.83.12.9             # search by IP/domain/URL substring
+otx --refresh              # refresh the cached ThreatFox export (auto every 6h)
+defang https://evil.example.com/x   # -> hxxps://evil[.]example[.]com/x
+refang hxxps://evil[.]example[.]com # reverse of defang
+hashf suspicious.bin        # md5 + sha1 + sha256 + size
+```
+
+`vt` aggregates a single verdict (`MALICIOUS` / `suspicious` / `no known reports` /
+`unknown`) from key-free sources by IOC type. `otx` downloads and caches the full
+ThreatFox export under `~/.nusecurity/cache` (6h TTL, `--refresh` to force).
+
+### Country focus (`--cc`)
+Filter feed commands to a single country — IPs are geolocated via ip-api and
+domains matched by ccTLD:
+```nu
+otx cobaltstrike --cc TR    # only Turkey-based C2s
+vrb --cc TR                 # only Turkey-based C2 panels (Viriback)
+tfox --dtype all --cc TR    # only Turkey-based ThreatFox IOCs
+haus online --cc TR --host-only  # only Turkey-based URLHaus hosts
+pls --cc TR                 # only Turkish proxies (uses native geo field)
+```
+
 ## Quick Examples
 ```nu
 hlp                         # compact command list with summary + sample
 hlp -v                      # verbose command list
 hlp triage                  # show detailed usage/examples for one command
 chkbgp 8.8.8.8              # BGP information for IP
+bdc SGVsbG8=               # base64 decode  (bdc -e "text" to encode)
 haus                        # URLHaus online feed (default)
 haus normal --limit 20      # full feed, first 20 URLs
 haus --host-only --contains "in.net" --limit 10  # unique hosts filtered by keyword
@@ -65,10 +104,13 @@ timeline-lite /var/tmp --with-hash --limit 100 # quick file timeline + optional 
 windows-evt-hunt --log Security --event-id 4625 --since-hours 24 # Windows event triage
 ```
 
+`vt` / `abuse` / `otx` are key-free: `vt` combines ThreatFox, Team Cymru MHR (md5/sha1 via DNS), CIRCL hashlookup, ISC SANS DShield, ip-api, and urlscan.io depending on IOC type; `abuse` uses DShield; `otx` searches the cached full ThreatFox export.
+`otx` matches malware family names with normalization (e.g. `agenttesla` matches `win.agent_tesla` / `Agent Tesla`); use `--recent` for the small live feed or `--refresh` to rebuild the cache.
+`--cc <CC>` filters `otx`, `vrb`, `tfox`, `haus`, and `pls` to a country (IPs geolocated via ip-api, domains matched by ccTLD; `pls` uses its native geo field).
 `triage` C2 output is heuristic and focuses on likely payload/C2 hosts from behavioral requests.
 When available, domains are shown together with IP as `domain [ip]`.
 `MalwareConfig` is now a structured record (`family/version/botnet/c2/URLs/Deobfuscated/credentials/mutex`) for cleaner table output.
-`haus` supports `--limit`, `--host-only`, `--contains`, `--host-contains`, `--host-ends-with`, `--https-only`, and `--raw`.
+`haus` supports `--limit`, `--host-only`, `--contains`, `--host-contains`, `--host-ends-with`, `--https-only`, `--cc`, and `--raw`.
 `rware` supports `--monitor`, `--interval`, `--limit`, and `--max-cycles` (test/debug loop count).
 `windows-evt-hunt` is Windows-only and uses PowerShell `Get-WinEvent`.
 `persist-hunt` checks common persistence points (Linux cron/systemd/autostart/shell init, Windows Run keys/startup/scheduled tasks).
@@ -81,6 +123,7 @@ When available, domains are shown together with IP as `domain [ip]`.
 - `fixu` formats a disk. Double-check target device before running.
 - `clean`, `aget`, `arem` run privileged operations.
 - `upc` pulls config from GitHub and overwrites your current Nu config path.
+- Threat-intel/enrichment commands (`vt`, `abuse`, `otx`, `ipinfo`, `--cc` filters, `haus`, `tfox`, `vrb`) send the IOCs/IPs you query to third-party services (ThreatFox, urlscan.io, ip-api, ISC SANS DShield, Team Cymru, CIRCL). Avoid submitting sensitive indicators you don't want disclosed.
 
 ## Update Config
 After setup, you can pull the latest upstream config from inside Nu:
