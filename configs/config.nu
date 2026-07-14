@@ -742,6 +742,38 @@ def iocall-progress [done: int, total: int, label: string] {
     print -en $"\r(ansi cyan_bold)[($barf)($bare)](ansi reset) ($pct | into string | fill --width 3 --alignment right)%  ($label | fill --width 18 --alignment left)"
 }
 
+# Draw a boxed VERDICT panel (score bar + indicators), colored by severity
+def verdict-panel [score: int, level: string, reasons: list<string>, color: string] {
+    let iw = 74                       # inner content width (between the ┃ borders)
+    let w = ($iw + 2)
+    let cc = { |s: string| $"(ansi $color)($s)(ansi reset)" }
+    let line = { |text: string| $"(do $cc '┃') ($text | fill --width $iw --alignment left) (do $cc '┃')" }
+
+    let title = " VERDICT "
+    let tlen = ($title | str length)
+    let lpad = (($w - $tlen) // 2)
+    let rpad = ($w - $tlen - $lpad)
+    print (do $cc $"┏(''| fill --width $lpad --character '━')($title)(''| fill --width $rpad --character '━')┓")
+    print (do $line $"Threat Score: ($score)/100  ($level)")
+    print (do $line "")
+
+    # colored bar — width computed on visible length so ansi codes don't misalign
+    let filled = ($score // 2)
+    let bar_visible = (2 + 50 + 2 + ($"($score)%" | str length))
+    let pad_n = ([($iw - $bar_visible) 0] | math max)
+    let bar = $"(ansi $color)(''| fill --width $filled --character '█')(ansi reset)(ansi dark_gray)(''| fill --width (50 - $filled) --character '░')(ansi reset)"
+    print $"(do $cc '┃')   ($bar)  ($score)%(''| fill --width $pad_n --character ' ') (do $cc '┃')"
+    print (do $line "")
+
+    print (do $line "Threat Indicators:")
+    for r in $reasons {
+        let txt = $"  • ($r)"
+        let clipped = (if (($txt | str length) > $iw) { $"($txt | str substring 0..($iw - 3))..." } else { $txt })
+        print (do $line $clipped)
+    }
+    print (do $cc $"┗(''| fill --width $w --character '━')┛")
+}
+
 # Run a list of { label, key, run: closure } steps, showing a progress bar,
 # and return a record of key -> result.
 def run-steps [steps: list<any>, show_progress: bool] {
@@ -785,9 +817,9 @@ def iocall [
         let data = (run-steps $steps $show_progress)
         let rep = ($data.reputation | default {})
         let av = ($data.virustotal | default { available: false })
-        if (($rep.verdict? | default "") == "MALICIOUS") { $score = ($score + 40); $reasons = ($reasons | append "ThreatFox/Cymru: known malicious sample") }
+        if (($rep.verdict? | default "") == "MALICIOUS") { $score = ($score + 40); $reasons = ($reasons | append "ThreatFox/Cymru: known malicious sample (+40)") }
         if (($av.available? | default false) and (($av.malicious? | default 0) > 0)) {
-            let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal: ($av.malicious) engines malicious")
+            let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal: ($av.malicious) engine\(s) flagged as MALICIOUS (+($p))")
         }
         $results = { reputation: $rep, virustotal: $av }
     } else if ($kind == "ip") {
@@ -811,16 +843,16 @@ def iocall [
         let ports = ($data.open_ports | default [])
         let ds = ($data.dshield | default {})
 
-        if (($tf_hits | length) > 0) { $score = ($score + 35); $reasons = ($reasons | append $"ThreatFox: known IOC (($tf_hits | get malware.0? | default 'malware'))") }
+        if (($tf_hits | length) > 0) { $score = ($score + 35); $reasons = ($reasons | append $"ThreatFox: known IOC (($tf_hits | get malware.0? | default 'malware')) (+35)") }
         if (($av.available? | default false) and (($av.malicious? | default 0) > 0)) {
-            let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal: ($av.malicious) engines malicious")
+            let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal: ($av.malicious) engine\(s) flagged as MALICIOUS (+($p))")
         }
         let listed = ($dnsbl.total_listed? | default 0)
-        if ($listed > 0) { let p = ([($listed * 8) 24] | math min); $score = ($score + $p); $reasons = ($reasons | append $"Listed on ($listed) DNS blacklist\(s)") }
+        if ($listed > 0) { let p = ([($listed * 8) 24] | math min); $score = ($score + $p); $reasons = ($reasons | append $"Listed on ($listed) DNS blacklist\(s) (+($p))") }
         let risky = ($ports | where risk == "HIGH")
-        if (($risky | length) > 0) { let p = (($risky | length) * 4); $score = ($score + $p); $reasons = ($reasons | append $"Risky open ports: (($risky | get service) | str join ', ')") }
+        if (($risky | length) > 0) { let p = (($risky | length) * 4); $score = ($score + $p); $reasons = ($reasons | append $"Risky open ports: (($risky | get service) | str join ', ') (+($p))") }
         let reports = (try { $ds.reports | into int } catch { 0 })
-        if ($reports > 0) { $score = ($score + 10); $reasons = ($reasons | append $"DShield: ($reports) attack report\(s)") }
+        if ($reports > 0) { $score = ($score + 10); $reasons = ($reasons | append $"DShield: ($reports) attack report\(s) (+10)") }
 
         $results = {
             virustotal: $av
@@ -852,13 +884,13 @@ def iocall [
         let av = ($data.virustotal | default { available: false })
         let dnsbl = ($data.ip_dnsbl | default { total_listed: 0 })
 
-        if (($rep.verdict? | default "") == "MALICIOUS") { $score = ($score + 35); $reasons = ($reasons | append $"ThreatFox: known malicious domain (($rep.threatfox? | default ''))") }
-        if (($rep.verdict? | default "") | str contains "suspicious") { $score = ($score + 10); $reasons = ($reasons | append "urlscan: suspicious verdict") }
+        if (($rep.verdict? | default "") == "MALICIOUS") { $score = ($score + 35); $reasons = ($reasons | append $"ThreatFox: known malicious domain (($rep.threatfox? | default '')) (+35)") }
+        if (($rep.verdict? | default "") | str contains "suspicious") { $score = ($score + 10); $reasons = ($reasons | append "urlscan: suspicious verdict (+10)") }
         if (($av.available? | default false) and (($av.malicious? | default 0) > 0)) {
-            let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal: ($av.malicious) engines malicious")
+            let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal: ($av.malicious) engine\(s) flagged as MALICIOUS (+($p))")
         }
         let listed = ($dnsbl.total_listed? | default 0)
-        if ($listed > 0) { let p = ([($listed * 8) 24] | math min); $score = ($score + $p); $reasons = ($reasons | append $"Resolved IP on ($listed) DNS blacklist\(s)") }
+        if ($listed > 0) { let p = ([($listed * 8) 24] | math min); $score = ($score + $p); $reasons = ($reasons | append $"Resolved IP on ($listed) DNS blacklist\(s) (+($p))") }
 
         $results = {
             resolved_ips: $ips
@@ -889,9 +921,9 @@ def iocall [
         let host_rep = ($data.host_reputation | default {})
         let av = ($data.virustotal | default { available: false })
 
-        if (($rep.verdict? | default "") == "MALICIOUS" or ($host_rep.verdict? | default "") == "MALICIOUS") { $score = ($score + 35); $reasons = ($reasons | append "ThreatFox: known malicious URL/host") }
+        if (($rep.verdict? | default "") == "MALICIOUS" or ($host_rep.verdict? | default "") == "MALICIOUS") { $score = ($score + 35); $reasons = ($reasons | append "ThreatFox: known malicious URL/host (+35)") }
         if (($av.available? | default false) and (($av.malicious? | default 0) > 0)) {
-            let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal \(host): ($av.malicious) engines malicious")
+            let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal \(host): ($av.malicious) engine\(s) flagged as MALICIOUS (+($p))")
         }
 
         $results = {
@@ -924,11 +956,13 @@ def iocall [
     }
 
     let level_color = (if $final_score <= 30 { "green_bold" } else if $final_score <= 50 { "yellow_bold" } else { "red_bold" })
-    print $"(ansi cyan_bold)IOC:(ansi reset) ($raw)   (ansi cyan_bold)type:(ansi reset) ($kind)   (ansi $level_color)($level) ($final_score)/100(ansi reset)"
-    $out | items { |section, value|
+    print $"(ansi cyan_bold)IOC:(ansi reset) ($raw)   (ansi cyan_bold)type:(ansi reset) ($kind)"
+    $out | reject summary | items { |section, value|
         print $"\n(ansi green_bold)== ($section) ==(ansi reset)"
         print ($value | table -e)
     } | ignore
+    print ""
+    verdict-panel $final_score $level ($summary.indicators) $level_color
 }
 
 # Start HTTPSERVER
