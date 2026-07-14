@@ -732,41 +732,86 @@ def threat-level [score: int] {
     if $score <= 10 { "CLEAN" } else if $score <= 30 { "LOW" } else if $score <= 50 { "MEDIUM" } else if $score <= 75 { "HIGH" } else { "CRITICAL" }
 }
 
+# Render an inline progress bar to stderr (overwrites its own line)
+def iocall-progress [done: int, total: int, label: string] {
+    let width = 22
+    let filled = ($done * $width // $total)
+    let barf = ("" | fill --width $filled --character "█")
+    let bare = ("" | fill --width ($width - $filled) --character "░")
+    let pct = ($done * 100 // $total)
+    print -en $"\r(ansi cyan_bold)[($barf)($bare)](ansi reset) ($pct | into string | fill --width 3 --alignment right)%  ($label | fill --width 18 --alignment left)"
+}
+
+# Run a list of { label, key, run: closure } steps, showing a progress bar,
+# and return a record of key -> result.
+def run-steps [steps: list<any>, show_progress: bool] {
+    let total = ($steps | length)
+    mut data = {}
+    for it in ($steps | enumerate) {
+        if $show_progress { iocall-progress ($it.index + 1) $total ($it.item.label) }
+        let v = (try { do $it.item.run } catch { null })
+        $data = ($data | upsert $it.item.key $v)
+    }
+    if $show_progress {
+        print -en $"\r(''| fill --width 55 --character ' ')\r"
+    }
+    $data
+}
+
 # One-shot IOC report: everything we know about a URL/domain/IP/hash from
-# key-free sources, with a heuristic threat score. Prints sectioned tables;
-# use --json for a structured record.
+# key-free sources, with a heuristic threat score and a live progress bar.
+# Prints sectioned tables; use --json for a structured record.
 def iocall [
     ioc: string        # URL, domain, IP, or file hash
     --json             # Return the aggregated record instead of printing
     --skip-ports       # Skip TCP port scan (IP/host)
+    --no-progress      # Hide the progress bar
     --limit: int = 25  # Cap for list sections (related domains, subdomains, ...)
 ] {
     let raw = ($ioc | str trim)
     if $raw == "" { error make { msg: "ioc cannot be empty." } }
     let kind = (ioc-type $raw)
+    let show_progress = ((not $json) and (not $no_progress))
 
     mut score = 0
     mut reasons = []
     mut results = {}
 
     if ($kind == "hash") {
-        let rep = (try { vt $raw } catch { {} })
-        let av = (try { vt-av $raw } catch { { available: false } })
+        let steps = [
+            { label: "Reputation", key: "reputation", run: { vt $raw } }
+            { label: "VirusTotal", key: "virustotal", run: { vt-av $raw } }
+        ]
+        let data = (run-steps $steps $show_progress)
+        let rep = ($data.reputation | default {})
+        let av = ($data.virustotal | default { available: false })
         if (($rep.verdict? | default "") == "MALICIOUS") { $score = ($score + 40); $reasons = ($reasons | append "ThreatFox/Cymru: known malicious sample") }
         if (($av.available? | default false) and (($av.malicious? | default 0) > 0)) {
             let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal: ($av.malicious) engines malicious")
         }
         $results = { reputation: $rep, virustotal: $av }
     } else if ($kind == "ip") {
-        let tf_hits = (try { otx $raw --limit $limit } catch { [] })
-        let av = (try { vt-av $raw } catch { { available: false } })
-        let ds = (try { abuse $raw } catch { {} })
-        let geo = (try { ipinfo $raw } catch { {} })
-        let dnsbl = (try { dnsbl-check $raw } catch { { total_listed: 0 } })
-        let ports = (if $skip_ports { [] } else { (try { port-scan $raw } catch { [] }) })
-        let rdns = (try { ^dig +short -x $raw | complete | get stdout | lines | first | default "-" } catch { "-" })
+        let steps = [
+            { label: "VirusTotal", key: "virustotal", run: { vt-av $raw } }
+            { label: "ThreatFox", key: "threatfox_hits", run: { otx $raw --limit $limit } }
+            { label: "DShield", key: "dshield", run: { abuse $raw } }
+            { label: "Geolocation", key: "geo", run: { ipinfo $raw } }
+            { label: "BGP / ASN", key: "bgp", run: { chkbgp $raw } }
+            { label: "RDAP", key: "rdap", run: { rdap-info $raw } }
+            { label: "Reverse DNS", key: "reverse_dns", run: { ^dig +short -x $raw | complete | get stdout | lines | first | default "-" } }
+            { label: "DNS blacklists", key: "dnsbl", run: { dnsbl-check $raw } }
+            { label: "Port scan", key: "open_ports", run: { if $skip_ports { [] } else { port-scan $raw } } }
+            { label: "Related domains", key: "related_domains", run: { related-domains $raw --limit $limit } }
+        ]
+        let data = (run-steps $steps $show_progress)
 
-        if (($tf_hits | length) > 0) { $score = ($score + 35); $reasons = ($reasons | append $"ThreatFox: known IOC ($tf_hits | get malware.0? | default 'malware')") }
+        let tf_hits = ($data.threatfox_hits | default [])
+        let av = ($data.virustotal | default { available: false })
+        let dnsbl = ($data.dnsbl | default { total_listed: 0 })
+        let ports = ($data.open_ports | default [])
+        let ds = ($data.dshield | default {})
+
+        if (($tf_hits | length) > 0) { $score = ($score + 35); $reasons = ($reasons | append $"ThreatFox: known IOC (($tf_hits | get malware.0? | default 'malware'))") }
         if (($av.available? | default false) and (($av.malicious? | default 0) > 0)) {
             let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal: ($av.malicious) engines malicious")
         }
@@ -778,24 +823,36 @@ def iocall [
         if ($reports > 0) { $score = ($score + 10); $reasons = ($reasons | append $"DShield: ($reports) attack report\(s)") }
 
         $results = {
-            geo: $geo
-            bgp: (try { chkbgp $raw } catch { {} })
-            rdap: (try { rdap-info $raw } catch { {} })
-            reverse_dns: $rdns
             virustotal: $av
+            threatfox_hits: $tf_hits
+            dshield: $ds
+            geo: ($data.geo | default {})
+            bgp: ($data.bgp | default {})
+            rdap: ($data.rdap | default {})
+            reverse_dns: ($data.reverse_dns | default "-")
             dnsbl: $dnsbl
             open_ports: $ports
-            related_domains: (try { related-domains $raw --limit $limit } catch { [] })
-            threatfox_hits: $tf_hits
+            related_domains: ($data.related_domains | default [])
         }
     } else if ($kind == "domain") {
         let ips = (try { ^dig +short A $raw | complete | get stdout | lines | each { |l| $l | str trim } | where { |l| $l =~ '^(?:\d{1,3}\.){3}\d{1,3}$' } } catch { [] })
         let primary = ($ips | get 0?)
-        let rep = (try { vt $raw } catch { {} })
-        let av = (try { vt-av $raw } catch { { available: false } })
-        let dnsbl = (if $primary != null { (try { dnsbl-check $primary } catch { { total_listed: 0 } }) } else { { total_listed: 0 } })
+        let steps = [
+            { label: "Reputation", key: "reputation", run: { vt $raw } }
+            { label: "VirusTotal", key: "virustotal", run: { vt-av $raw } }
+            { label: "DNS records", key: "dns", run: { dns-records $raw } }
+            { label: "RDAP", key: "rdap", run: { rdap-info $raw } }
+            { label: "Subdomains (crt.sh)", key: "subdomains", run: { crt $raw | first $limit } }
+            { label: "Resolved-IP geo", key: "ip_geo", run: { if $primary != null { ipinfo $primary } else { {} } } }
+            { label: "IP blacklists", key: "ip_dnsbl", run: { if $primary != null { dnsbl-check $primary } else { { total_listed: 0 } } } }
+        ]
+        let data = (run-steps $steps $show_progress)
 
-        if (($rep.verdict? | default "") == "MALICIOUS") { $score = ($score + 35); $reasons = ($reasons | append $"ThreatFox: known malicious domain ($rep.threatfox? | default '')") }
+        let rep = ($data.reputation | default {})
+        let av = ($data.virustotal | default { available: false })
+        let dnsbl = ($data.ip_dnsbl | default { total_listed: 0 })
+
+        if (($rep.verdict? | default "") == "MALICIOUS") { $score = ($score + 35); $reasons = ($reasons | append $"ThreatFox: known malicious domain (($rep.threatfox? | default ''))") }
         if (($rep.verdict? | default "") | str contains "suspicious") { $score = ($score + 10); $reasons = ($reasons | append "urlscan: suspicious verdict") }
         if (($av.available? | default false) and (($av.malicious? | default 0) > 0)) {
             let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal: ($av.malicious) engines malicious")
@@ -807,10 +864,10 @@ def iocall [
             resolved_ips: $ips
             reputation: $rep
             virustotal: $av
-            dns: (try { dns-records $raw } catch { {} })
-            rdap: (try { rdap-info $raw } catch { {} })
-            subdomains: (try { crt $raw | first $limit } catch { [] })
-            ip_geo: (if $primary != null { (try { ipinfo $primary } catch { {} }) } else { {} })
+            dns: ($data.dns | default {})
+            rdap: ($data.rdap | default {})
+            subdomains: ($data.subdomains | default [])
+            ip_geo: ($data.ip_geo | default {})
             ip_dnsbl: $dnsbl
         }
     } else {
@@ -818,9 +875,19 @@ def iocall [
         let host = (ioc-host $raw)
         let ips = (try { ^dig +short A $host | complete | get stdout | lines | each { |l| $l | str trim } | where { |l| $l =~ '^(?:\d{1,3}\.){3}\d{1,3}$' } } catch { [] })
         let primary = ($ips | get 0?)
-        let rep = (try { vt $raw --type url } catch { {} })
-        let host_rep = (try { vt $host } catch { {} })
-        let av = (try { vt-av $host } catch { { available: false } })
+        let steps = [
+            { label: "URL reputation", key: "reputation", run: { vt $raw --type url } }
+            { label: "Host reputation", key: "host_reputation", run: { vt $host } }
+            { label: "VirusTotal (host)", key: "virustotal", run: { vt-av $host } }
+            { label: "DNS records", key: "dns", run: { dns-records $host } }
+            { label: "RDAP", key: "rdap", run: { rdap-info $host } }
+            { label: "Resolved-IP geo", key: "ip_geo", run: { if $primary != null { ipinfo $primary } else { {} } } }
+        ]
+        let data = (run-steps $steps $show_progress)
+
+        let rep = ($data.reputation | default {})
+        let host_rep = ($data.host_reputation | default {})
+        let av = ($data.virustotal | default { available: false })
 
         if (($rep.verdict? | default "") == "MALICIOUS" or ($host_rep.verdict? | default "") == "MALICIOUS") { $score = ($score + 35); $reasons = ($reasons | append "ThreatFox: known malicious URL/host") }
         if (($av.available? | default false) and (($av.malicious? | default 0) > 0)) {
@@ -834,9 +901,9 @@ def iocall [
             host_reputation: $host_rep
             virustotal: $av
             resolved_ips: $ips
-            dns: (try { dns-records $host } catch { {} })
-            rdap: (try { rdap-info $host } catch { {} })
-            ip_geo: (if $primary != null { (try { ipinfo $primary } catch { {} }) } else { {} })
+            dns: ($data.dns | default {})
+            rdap: ($data.rdap | default {})
+            ip_geo: ($data.ip_geo | default {})
         }
     }
 
