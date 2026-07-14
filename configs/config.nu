@@ -336,7 +336,7 @@ def vt [ioc: string, --type: string] {
         let tf = (threatfox-find $value $kind)
         let query = if $kind == "domain" { $"domain:($value)" } else { $"page.url:\"($value)\"" }
         let resp = (try {
-            http get $"https://urlscan.io/api/v1/search/?q=($query)&size=100"
+            http get --max-time 12sec $"https://urlscan.io/api/v1/search/?q=($query)&size=100"
         } catch {
             null
         })
@@ -549,7 +549,7 @@ def dns-records [domain: string] {
 
 # Reverse-IP: other domains sharing an IP, via HackerTarget (no key)
 def reverse-ip [ip: string, --limit: int = 50] {
-    let body = (try { http get $"https://api.hackertarget.com/reverseiplookup/?q=($ip)" | into string } catch { "" })
+    let body = (try { http get --max-time 10sec $"https://api.hackertarget.com/reverseiplookup/?q=($ip)" | into string } catch { "" })
     let lc = ($body | str lowercase)
     let bad = ($body == "" or ($lc | str contains "error") or ($lc | str contains "api count") or ($lc | str contains "no dns") or ($lc | str contains "no records"))
     if $bad {
@@ -573,7 +573,7 @@ def vt-av [target: string] {
         "X-VT-Anti-Abuse-Header": "MTA3OTM2NjUwMjctWkc5dWRDQmlaU0JsZG1scy0xNzEwMzUyNjk1LjY1Nw=="
         "Accept-Ianguage": "en-US,en;q=0.9,es;q=0.8"
     }
-    let d = (try { http get --headers $headers $"https://www.virustotal.com/ui/($resource)/($target)" } catch { null })
+    let d = (try { http get --max-time 12sec --headers $headers $"https://www.virustotal.com/ui/($resource)/($target)" } catch { null })
     if $d == null { return { available: false } }
 
     let attr = ($d.data?.attributes? | default {})
@@ -615,7 +615,7 @@ def related-domains [ip: string, --limit: int = 30] {
 
     # crt.sh certificate transparency
     let crt = (try {
-        http get $"https://crt.sh/?q=($ip)&output=json"
+        http get --max-time 12sec $"https://crt.sh/?q=($ip)&output=json"
         | each { |e| $e.name_value? | default "" | split row "\n" }
         | flatten
         | each { |n| $n | str trim --char '*' | str trim --char '.' }
@@ -631,7 +631,7 @@ def related-domains [ip: string, --limit: int = 30] {
             "X-VT-Anti-Abuse-Header": "MTA3OTM2NjUwMjctWkc5dWRDQmlaU0JsZG1scy0xNzEwMzUyNjk1LjY1Nw=="
             "Accept-Ianguage": "en-US,en;q=0.9,es;q=0.8"
         }
-        http get --headers $headers $"https://www.virustotal.com/ui/ip_addresses/($ip)/resolutions?limit=40"
+        http get --max-time 12sec --headers $headers $"https://www.virustotal.com/ui/ip_addresses/($ip)/resolutions?limit=40"
         | get data
         | each { |item| $item.attributes?.host_name? | default "" }
     } catch { [] })
@@ -819,7 +819,7 @@ def iocall [
         let av = ($data.virustotal | default { available: false })
         if (($rep.verdict? | default "") == "MALICIOUS") { $score = ($score + 40); $reasons = ($reasons | append "ThreatFox/Cymru: known malicious sample (+40)") }
         if (($av.available? | default false) and (($av.malicious? | default 0) > 0)) {
-            let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal: ($av.malicious) engine\(s) flagged as MALICIOUS (+($p))")
+            let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal: ($av.malicious) engine\(s) flagged as MALICIOUS \(+($p))")
         }
         $results = { reputation: $rep, virustotal: $av }
     } else if ($kind == "ip") {
@@ -843,16 +843,16 @@ def iocall [
         let ports = ($data.open_ports | default [])
         let ds = ($data.dshield | default {})
 
-        if (($tf_hits | length) > 0) { $score = ($score + 35); $reasons = ($reasons | append $"ThreatFox: known IOC (($tf_hits | get malware.0? | default 'malware')) (+35)") }
+        if (($tf_hits | length) > 0) { $score = ($score + 35); $reasons = ($reasons | append $"ThreatFox: known IOC (($tf_hits | get malware.0? | default 'malware')) \(+35)") }
         if (($av.available? | default false) and (($av.malicious? | default 0) > 0)) {
-            let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal: ($av.malicious) engine\(s) flagged as MALICIOUS (+($p))")
+            let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal: ($av.malicious) engine\(s) flagged as MALICIOUS \(+($p))")
         }
         let listed = ($dnsbl.total_listed? | default 0)
-        if ($listed > 0) { let p = ([($listed * 8) 24] | math min); $score = ($score + $p); $reasons = ($reasons | append $"Listed on ($listed) DNS blacklist\(s) (+($p))") }
+        if ($listed > 0) { let p = ([($listed * 8) 24] | math min); $score = ($score + $p); $reasons = ($reasons | append $"Listed on ($listed) DNS blacklist\(s) \(+($p))") }
         let risky = ($ports | where risk == "HIGH")
-        if (($risky | length) > 0) { let p = (($risky | length) * 4); $score = ($score + $p); $reasons = ($reasons | append $"Risky open ports: (($risky | get service) | str join ', ') (+($p))") }
+        if (($risky | length) > 0) { let p = (($risky | length) * 4); $score = ($score + $p); $reasons = ($reasons | append $"Risky open ports: (($risky | get service) | str join ', ') \(+($p))") }
         let reports = (try { $ds.reports | into int } catch { 0 })
-        if ($reports > 0) { $score = ($score + 10); $reasons = ($reasons | append $"DShield: ($reports) attack report\(s) (+10)") }
+        if ($reports > 0) { $score = ($score + 10); $reasons = ($reasons | append $"DShield: ($reports) attack report\(s) \(+10)") }
 
         $results = {
             virustotal: $av
@@ -884,13 +884,13 @@ def iocall [
         let av = ($data.virustotal | default { available: false })
         let dnsbl = ($data.ip_dnsbl | default { total_listed: 0 })
 
-        if (($rep.verdict? | default "") == "MALICIOUS") { $score = ($score + 35); $reasons = ($reasons | append $"ThreatFox: known malicious domain (($rep.threatfox? | default '')) (+35)") }
+        if (($rep.verdict? | default "") == "MALICIOUS") { $score = ($score + 35); $reasons = ($reasons | append $"ThreatFox: known malicious domain (($rep.threatfox? | default '')) \(+35)") }
         if (($rep.verdict? | default "") | str contains "suspicious") { $score = ($score + 10); $reasons = ($reasons | append "urlscan: suspicious verdict (+10)") }
         if (($av.available? | default false) and (($av.malicious? | default 0) > 0)) {
-            let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal: ($av.malicious) engine\(s) flagged as MALICIOUS (+($p))")
+            let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal: ($av.malicious) engine\(s) flagged as MALICIOUS \(+($p))")
         }
         let listed = ($dnsbl.total_listed? | default 0)
-        if ($listed > 0) { let p = ([($listed * 8) 24] | math min); $score = ($score + $p); $reasons = ($reasons | append $"Resolved IP on ($listed) DNS blacklist\(s) (+($p))") }
+        if ($listed > 0) { let p = ([($listed * 8) 24] | math min); $score = ($score + $p); $reasons = ($reasons | append $"Resolved IP on ($listed) DNS blacklist\(s) \(+($p))") }
 
         $results = {
             resolved_ips: $ips
@@ -923,7 +923,7 @@ def iocall [
 
         if (($rep.verdict? | default "") == "MALICIOUS" or ($host_rep.verdict? | default "") == "MALICIOUS") { $score = ($score + 35); $reasons = ($reasons | append "ThreatFox: known malicious URL/host (+35)") }
         if (($av.available? | default false) and (($av.malicious? | default 0) > 0)) {
-            let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal \(host): ($av.malicious) engine\(s) flagged as MALICIOUS (+($p))")
+            let p = ([($av.malicious * 4) 40] | math min); $score = ($score + $p); $reasons = ($reasons | append $"VirusTotal \(host): ($av.malicious) engine\(s) flagged as MALICIOUS \(+($p))")
         }
 
         $results = {
